@@ -23,7 +23,7 @@ cl /nologo /std:c++20 /EHsc /W4 /O1 /Os /GL /Gy /GF /MT /DNDEBUG ^
    src\main.cpp src\port_monitor.cpp src\system_monitor.cpp src\audio_waveform.cpp src\app_ui.cpp ^
    /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF /MANIFEST:EMBED /MANIFESTINPUT:app.manifest ^
    /OUT:build\PortTool.exe ^
-   d2d1.lib dwrite.lib dwmapi.lib setupapi.lib iphlpapi.lib powrprof.lib pdh.lib dxgi.lib psapi.lib ole32.lib user32.lib gdi32.lib advapi32.lib
+   d2d1.lib dwrite.lib dwmapi.lib setupapi.lib iphlpapi.lib powrprof.lib pdh.lib dxgi.lib psapi.lib shell32.lib ole32.lib user32.lib gdi32.lib advapi32.lib
 
 if errorlevel 1 (
     echo Build failed!

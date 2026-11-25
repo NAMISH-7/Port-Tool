@@ -48,6 +48,8 @@ public:
     void     SetDarkMode(bool dark);
     bool     NeedsFastRedraw() const;
     uint32_t GetSampleIntervalMs() const { return sampleIntervalMs_; }
+    bool     GetMinimizeToTray() const { return minimizeToTray_; }
+    void     OnHiddenToTray();
 
 private:
     enum MainTab {
@@ -86,7 +88,9 @@ private:
         kActSetDataBytes,
         kActSetDataBits,
         kActToggleShowUnused,
-        kActToggleAudioWave
+        kActToggleAudioWave,
+        kActToggleStartWithWin,
+        kActToggleMinimizeToTray
     };
 
     bool CreateDeviceResources();
@@ -153,12 +157,16 @@ private:
     float        sysScrollY_      = 0.0f;
     float        sysMaxScrollY_   = 0.0f;
 
-    // App-only Settings (never modifies Windows or hardware)
+    // App-only Settings (never modifies Windows device properties)
     uint32_t     sampleIntervalMs_   = kSampleIntervalMs;
     bool         useFahrenheit_      = false;
     bool         useBitsPerSec_      = false;
     bool         showUnusedPorts_    = true;
     bool         enableAudioWave_    = true;
+    bool         startWithWindows_   = false;
+    bool         minimizeToTray_     = true;
+    float        settingsScrollY_    = 0.0f;
+    float        settingsMaxScrollY_ = 0.0f;
 
     // Hover state
     float mouseX_ = -1.0f;

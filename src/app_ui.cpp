@@ -47,10 +47,70 @@ std::wstring FormatSecondsAgo(size_t n, size_t idx) {
     return buf;
 }
 
+constexpr const wchar_t* kRunKeyPath     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr const wchar_t* kRunValueName   = L"PortTool";
+constexpr const wchar_t* kAppPrefKeyPath = L"Software\\PortTool";
+
+bool QueryStartWithWindows() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD type = 0, sz = 0;
+    bool exists = (RegQueryValueExW(hKey, kRunValueName, nullptr, &type, nullptr, &sz) == ERROR_SUCCESS &&
+                   (type == REG_SZ || type == REG_EXPAND_SZ) && sz > sizeof(wchar_t));
+    RegCloseKey(hKey);
+    return exists;
+}
+
+bool SetStartWithWindows(bool enable) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+    bool ok = false;
+    if (enable) {
+        wchar_t exePath[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+            std::wstring cmd = L"\"" + std::wstring(exePath) + L"\" --minimized";
+            DWORD bytes = static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t));
+            ok = (RegSetValueExW(hKey, kRunValueName, 0, REG_SZ,
+                                 reinterpret_cast<const BYTE*>(cmd.c_str()), bytes) == ERROR_SUCCESS);
+        }
+    } else {
+        LONG r = RegDeleteValueW(hKey, kRunValueName);
+        ok = (r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND);
+    }
+    RegCloseKey(hKey);
+    return ok;
+}
+
+bool LoadMinimizeToTrayPref() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kAppPrefKeyPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return true; // Default ON
+    }
+    DWORD val = 1, sz = sizeof(val);
+    RegQueryValueExW(hKey, L"MinimizeToTray", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz);
+    RegCloseKey(hKey);
+    return val != 0;
+}
+
+void SaveMinimizeToTrayPref(bool enable) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kAppPrefKeyPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        DWORD val = enable ? 1u : 0u;
+        RegSetValueExW(hKey, L"MinimizeToTray", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(hKey);
+    }
+}
+
 } // namespace
 
 AppUI::AppUI() {
-    theme_ = MakeDarkTheme();
+    theme_            = MakeDarkTheme();
+    startWithWindows_ = QueryStartWithWindows();
+    minimizeToTray_   = LoadMinimizeToTrayPref();
 }
 
 AppUI::~AppUI() {
@@ -170,6 +230,11 @@ bool AppUI::NeedsFastRedraw() const {
     return activeTab_ == kTabPorts && inDetailView_ && audioTap_.IsCapturing();
 }
 
+void AppUI::OnHiddenToTray() {
+    audioTap_.Stop();
+    menuOpen_ = false;
+}
+
 void AppUI::SyncAudioWaveformTarget() {
     if (enableAudioWave_ && activeTab_ == kTabPorts && inDetailView_) {
         const PortInfo* p = FindSelectedPort();
@@ -268,6 +333,15 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
                 case kActToggleAudioWave:
                     enableAudioWave_ = !enableAudioWave_;
                     break;
+                case kActToggleStartWithWin:
+                    if (SetStartWithWindows(!startWithWindows_)) {
+                        startWithWindows_ = !startWithWindows_;
+                    }
+                    break;
+                case kActToggleMinimizeToTray:
+                    minimizeToTray_ = !minimizeToTray_;
+                    SaveMinimizeToTrayPref(minimizeToTray_);
+                    break;
                 case kActFilterAll:
                     categoryFilter_ = -1;
                     scrollY_ = 0.0f;
@@ -330,6 +404,7 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
 }
 
 void AppUI::OnMouseWheel(int delta) {
+    if (menuOpen_) return;
     if (activeTab_ == kTabPorts && !inDetailView_) {
         scrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
         scrollY_ = std::clamp(scrollY_, 0.0f, maxScrollY_);
@@ -337,6 +412,10 @@ void AppUI::OnMouseWheel(int delta) {
     } else if (activeTab_ == kTabSystem && !inSysDetailView_) {
         sysScrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
         sysScrollY_ = std::clamp(sysScrollY_, 0.0f, sysMaxScrollY_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (activeTab_ == kTabSettings) {
+        settingsScrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
+        settingsScrollY_ = std::clamp(settingsScrollY_, 0.0f, settingsMaxScrollY_);
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
@@ -568,12 +647,22 @@ void AppUI::DrawBurgerMenuOverlay(float width, float height) {
 
 void AppUI::DrawSettingsPage(float width, float height) {
     constexpr float kPad = 24.0f;
-    float maxW = std::min(width - kPad * 2.0f, 860.0f);
-    float left = (width - maxW) * 0.5f;
-    float y    = 76.0f;
+    float maxW   = std::min(width - kPad * 2.0f, 860.0f);
+    float left   = (width - maxW) * 0.5f;
+    float viewTop = 58.0f;
+    float viewH   = std::max(100.0f, height - viewTop);
+
+    // 8 rows * (68 + 12) + header(64) + footer(74) + padding(24)
+    float totalContentH = 64.0f + 8.0f * 80.0f + 74.0f + 24.0f;
+    settingsMaxScrollY_ = std::max(0.0f, totalContentH - viewH);
+    settingsScrollY_    = std::clamp(settingsScrollY_, 0.0f, settingsMaxScrollY_);
+
+    rt_->PushAxisAlignedClip(D2D1::RectF(0, viewTop, width, height), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    float y = 74.0f - settingsScrollY_;
 
     DrawTextLine(L"Settings", D2D1::RectF(left, y, left + 300, y + 30), fmtTitle_, theme_.textPrimary);
-    DrawTextLine(L"In-app display & polling preferences only — never modifies Windows or device properties",
+    DrawTextLine(L"App display, startup & tray preferences — never modifies hardware or device properties",
                  D2D1::RectF(left, y + 30, left + maxW, y + 50), fmtSmall_, theme_.textSecondary);
     y += 64.0f;
 
@@ -581,29 +670,41 @@ void AppUI::DrawSettingsPage(float width, float height) {
                               const std::vector<std::tuple<const wchar_t*, bool, int>>& opts) {
         float rowH = 68.0f;
         D2D1_RECT_F card = D2D1::RectF(left, y, left + maxW, y + rowH);
-        DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+        if (card.bottom >= viewTop && card.top <= height) {
+            DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
 
-        DrawTextLine(title, D2D1::RectF(card.left + 16, card.top + 10, card.left + maxW * 0.52f, card.top + 34),
-                     fmtBold_, theme_.textPrimary);
-        DrawTextLine(desc,  D2D1::RectF(card.left + 16, card.top + 34, card.left + maxW * 0.54f, card.top + 56),
-                     fmtSmall_, theme_.textSecondary);
+            DrawTextLine(title, D2D1::RectF(card.left + 16, card.top + 10, card.left + maxW * 0.52f, card.top + 34),
+                         fmtBold_, theme_.textPrimary);
+            DrawTextLine(desc,  D2D1::RectF(card.left + 16, card.top + 34, card.left + maxW * 0.56f, card.top + 56),
+                         fmtSmall_, theme_.textSecondary);
 
-        float btnW = (opts.size() == 3) ? 94.0f : 124.0f;
-        float gap  = 8.0f;
-        float totalW = static_cast<float>(opts.size()) * btnW + static_cast<float>(opts.size() - 1) * gap;
-        float bx = card.right - 16.0f - totalW;
-        for (const auto& [label, selected, actId] : opts) {
-            D2D1_RECT_F br = D2D1::RectF(bx, card.top + 18.0f, bx + btnW, card.bottom - 18.0f);
-            bool hover = !menuOpen_ && mouseInside_ && PtInRectF(br, mouseX_, mouseY_);
-            D2D1_COLOR_F bg = selected ? theme_.bgPillActive : (hover ? theme_.bgSurfaceHover : theme_.bgPillIdle);
-            D2D1_COLOR_F fg = selected ? theme_.textOnAccent : theme_.textPrimary;
-            DrawRoundedRect(br, 8.0f, bg, selected ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
-            DrawTextLine(label, br, fmtSmall_, fg, DWRITE_TEXT_ALIGNMENT_CENTER);
-            hitButtons_.push_back({br, actId, L""});
-            bx += btnW + gap;
+            float btnW = (opts.size() == 3) ? 94.0f : (opts.size() == 1 ? 154.0f : 124.0f);
+            float gap  = 8.0f;
+            float totalW = static_cast<float>(opts.size()) * btnW + static_cast<float>(opts.size() - 1) * gap;
+            float bx = card.right - 16.0f - totalW;
+            for (const auto& [label, selected, actId] : opts) {
+                D2D1_RECT_F br = D2D1::RectF(bx, card.top + 18.0f, bx + btnW, card.bottom - 18.0f);
+                bool hover = !menuOpen_ && mouseInside_ && PtInRectF(br, mouseX_, mouseY_) && mouseY_ >= viewTop;
+                D2D1_COLOR_F bg = selected ? theme_.bgPillActive : (hover ? theme_.bgSurfaceHover : theme_.bgPillIdle);
+                D2D1_COLOR_F fg = selected ? theme_.textOnAccent : theme_.textPrimary;
+                DrawRoundedRect(br, 8.0f, bg, selected ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
+                DrawTextLine(label, br, fmtSmall_, fg, DWRITE_TEXT_ALIGNMENT_CENTER);
+                if (br.bottom > viewTop && br.top < height) {
+                    hitButtons_.push_back({br, actId, L""});
+                }
+                bx += btnW + gap;
+            }
         }
         y += rowH + 12.0f;
     };
+
+    drawSettingRow(L"Start on Windows Startup", L"Launch Port Tool automatically in the background when you sign in", {
+        { startWithWindows_ ? L"Enabled" : L"Disabled", startWithWindows_, kActToggleStartWithWin }
+    });
+
+    drawSettingRow(L"Minimize to Tray on Close (X)", L"Hide to the system tray instead of exiting when clicking X (right-click tray to Exit)", {
+        { minimizeToTray_ ? L"Minimize to Tray" : L"Exit App", minimizeToTray_, kActToggleMinimizeToTray }
+    });
 
     drawSettingRow(L"Appearance Theme", L"Switch between Dark Mode and Light Mode", {
         { L"Dark Mode",  isDark_,  kActSetThemeDark },
@@ -634,15 +735,17 @@ void AppUI::DrawSettingsPage(float width, float height) {
         { enableAudioWave_ ? L"Enabled" : L"Disabled", enableAudioWave_, kActToggleAudioWave }
     });
 
-    if (y + 66.0f < height) {
-        D2D1_RECT_F secCard = D2D1::RectF(left, y, left + maxW, y + 62.0f);
+    D2D1_RECT_F secCard = D2D1::RectF(left, y, left + maxW, y + 62.0f);
+    if (secCard.bottom >= viewTop && secCard.top <= height) {
         DrawRoundedRect(secCard, 10.0f, theme_.bgBadgeActive, theme_.border, 1.0f);
-        DrawTextLine(L"Read-Only Guarantee", D2D1::RectF(secCard.left + 16, secCard.top + 8, secCard.right - 16, secCard.top + 30),
+        DrawTextLine(L"Read-Only Hardware Guarantee", D2D1::RectF(secCard.left + 16, secCard.top + 8, secCard.right - 16, secCard.top + 30),
                      fmtBold_, theme_.statusActive);
-        DrawTextLine(L"Port Tool runs without administrator privileges (asInvoker) and never writes to device properties, drivers, or Windows settings.",
+        DrawTextLine(L"Port Tool runs without administrator privileges (asInvoker) and never alters any hardware or device properties.",
                      D2D1::RectF(secCard.left + 16, secCard.top + 32, secCard.right - 16, secCard.top + 54),
                      fmtSmall_, theme_.textSecondary);
     }
+
+    rt_->PopAxisAlignedClip();
 }
 
 // ============================================================================

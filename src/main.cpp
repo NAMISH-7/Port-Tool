@@ -8,17 +8,24 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <objbase.h>
+#include <shellapi.h>
 
 #include "port_monitor.h"
 #include "system_monitor.h"
 #include "app_ui.h"
 
 #include <atomic>
+#include <cwchar>
 #include <thread>
 
 namespace {
 
-constexpr UINT WM_PORTS_UPDATED = WM_APP + 1;
+constexpr UINT WM_PORTS_UPDATED  = WM_APP + 1;
+constexpr UINT WM_TRAY_ICON      = WM_APP + 2;
+constexpr UINT WM_RESTORE_WINDOW = WM_APP + 3;
+constexpr UINT kTrayIconId       = 1001;
+constexpr UINT kCmdTrayOpen      = 2001;
+constexpr UINT kCmdTrayExit      = 2002;
 
 struct AppContext {
     porttool::PortMonitor   portMonitor;
@@ -27,7 +34,52 @@ struct AppContext {
     std::atomic<bool>       running{true};
     std::thread             pollThread;
     bool                    trackingMouse = false;
+    bool                    trayAdded     = false;
+    NOTIFYICONDATAW         nid{};
 };
+
+void AddTrayIcon(HWND hwnd, AppContext* ctx) {
+    if (ctx->trayAdded) return;
+    ctx->nid = {};
+    ctx->nid.cbSize           = sizeof(NOTIFYICONDATAW);
+    ctx->nid.hWnd             = hwnd;
+    ctx->nid.uID              = kTrayIconId;
+    ctx->nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    ctx->nid.uCallbackMessage = WM_TRAY_ICON;
+    ctx->nid.hIcon            = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(ctx->nid.szTip, L"Port Tool - Read-Only Hardware Monitor");
+    if (Shell_NotifyIconW(NIM_ADD, &ctx->nid)) {
+        ctx->trayAdded = true;
+    }
+}
+
+void RemoveTrayIcon(AppContext* ctx) {
+    if (!ctx->trayAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
+    ctx->trayAdded = false;
+}
+
+void RestoreFromTray(HWND hwnd) {
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+void ShowTrayContextMenu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING, kCmdTrayOpen, L"Open Port Tool");
+    SetMenuDefaultItem(menu, kCmdTrayOpen, FALSE);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCmdTrayExit, L"Exit Port Tool");
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
 
 float GetDpiScale(HWND hwnd) {
     UINT dpi = GetDpiForWindow(hwnd);
@@ -121,7 +173,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_CLOSE:
+            if (ctx && ctx->ui.GetMinimizeToTray()) {
+                AddTrayIcon(hwnd, ctx);
+                ctx->ui.OnHiddenToTray();
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_TRAY_ICON:
+            if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+                RestoreFromTray(hwnd);
+            } else if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+                ShowTrayContextMenu(hwnd);
+            }
+            return 0;
+
+        case WM_RESTORE_WINDOW:
+            RestoreFromTray(hwnd);
+            return 0;
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == kCmdTrayOpen) {
+                RestoreFromTray(hwnd);
+            } else if (LOWORD(wParam) == kCmdTrayExit) {
+                if (ctx) RemoveTrayIcon(ctx);
+                DestroyWindow(hwnd);
+            }
+            return 0;
+
         case WM_DESTROY:
+            if (ctx) RemoveTrayIcon(ctx);
             PostQuitMessage(0);
             return 0;
     }
@@ -131,7 +215,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow) {
+    // Single-instance check: if already running (e.g. in tray), restore existing window
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\PortTool_SingleInstance_Mutex");
+    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = FindWindowW(L"PortToolMainWindowClass", nullptr);
+        if (existing) {
+            PostMessageW(existing, WM_RESTORE_WINDOW, 0, 0);
+        }
+        CloseHandle(hMutex);
+        return 0;
+    }
+
+    bool startMinimized = (pCmdLine && wcsstr(pCmdLine, L"--minimized") != nullptr);
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -166,8 +263,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         return 1;
     }
 
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
+    AddTrayIcon(hwnd, &ctx);
+    if (startMinimized) {
+        ShowWindow(hwnd, SW_HIDE);
+    } else {
+        ShowWindow(hwnd, nCmdShow);
+        UpdateWindow(hwnd);
+    }
     SetTimer(hwnd, 1, 33, nullptr); // 30 FPS refresh ONLY when viewing live audio waveform
 
     // Background live read-only polling thread (respects Settings sample rate)
@@ -204,6 +306,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ctx.ui.Shutdown();
     CoUninitialize();
+    if (hMutex) CloseHandle(hMutex);
     return 0;
 }
 
