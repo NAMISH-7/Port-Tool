@@ -56,11 +56,22 @@ private:
         int& globalPortCounter
     );
 
+    void InitPowerCounters();
+    void ShutdownPowerCounters();
+    void SamplePowerMeters(double& outAcpiMeterWatts, double& outPkgWatts);
+
     mutable std::mutex mutex_;
     std::vector<std::wstring> portOrder_;
     std::unordered_map<std::wstring, PortInfo> ports_;
     std::unordered_map<std::wstring, ByteCounterPrev> prevCounters_;
     uint64_t startTickMs_ = 0;
+
+    // Read-only PDH handles for ACPI Power Meter & Hardware Energy Meter (RAPL)
+    void* pdhQuery_     = nullptr;
+    void* pdhAcpiPower_ = nullptr;
+    void* pdhRaplPkg_   = nullptr;
+    bool  pdhPrimed_    = false;
 };
 
 } // namespace porttool
+

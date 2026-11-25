@@ -19,6 +19,7 @@
 #include <usb100.h>
 #include <batclass.h>
 #include <powrprof.h>
+#include <pdh.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <audioclient.h>
@@ -180,9 +181,67 @@ std::wstring FormatLinkSpeed(uint64_t bitsPerSec) {
 
 PortMonitor::PortMonitor() {
     startTickMs_ = GetTickCount64();
+    InitPowerCounters();
 }
 
-PortMonitor::~PortMonitor() = default;
+PortMonitor::~PortMonitor() {
+    ShutdownPowerCounters();
+}
+
+void PortMonitor::InitPowerCounters() {
+    PDH_HQUERY q = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS || !q) return;
+    pdhQuery_ = q;
+
+    PDH_HCOUNTER hAcpi = nullptr;
+    if (PdhAddEnglishCounterW(q, L"\\Power Meter(_Total)\\Power", 0, &hAcpi) == ERROR_SUCCESS) {
+        pdhAcpiPower_ = hAcpi;
+    }
+
+    PDH_HCOUNTER hRapl = nullptr;
+    if (PdhAddEnglishCounterW(q, L"\\Energy Meter(RAPL_Package0_PKG)\\Power", 0, &hRapl) == ERROR_SUCCESS) {
+        pdhRaplPkg_ = hRapl;
+    }
+
+    if (pdhAcpiPower_ || pdhRaplPkg_) {
+        PdhCollectQueryData(q);
+    }
+}
+
+void PortMonitor::ShutdownPowerCounters() {
+    if (pdhQuery_) {
+        PdhCloseQuery(static_cast<PDH_HQUERY>(pdhQuery_));
+        pdhQuery_ = nullptr;
+        pdhAcpiPower_ = nullptr;
+        pdhRaplPkg_ = nullptr;
+    }
+}
+
+void PortMonitor::SamplePowerMeters(double& outAcpiMeterWatts, double& outPkgWatts) {
+    outAcpiMeterWatts = 0.0;
+    outPkgWatts = 0.0;
+    if (!pdhQuery_) return;
+
+    if (PdhCollectQueryData(static_cast<PDH_HQUERY>(pdhQuery_)) != ERROR_SUCCESS) return;
+    if (!pdhPrimed_) {
+        pdhPrimed_ = true;
+    }
+
+    if (pdhAcpiPower_) {
+        PDH_FMT_COUNTERVALUE val{};
+        if (PdhGetFormattedCounterValue(static_cast<PDH_HCOUNTER>(pdhAcpiPower_), PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS &&
+            val.CStatus == ERROR_SUCCESS && val.doubleValue > 0.0) {
+            outAcpiMeterWatts = val.doubleValue / 1000.0; // mW -> W
+        }
+    }
+    if (pdhRaplPkg_) {
+        PDH_FMT_COUNTERVALUE val{};
+        if (PdhGetFormattedCounterValue(static_cast<PDH_HCOUNTER>(pdhRaplPkg_), PDH_FMT_DOUBLE, nullptr, &val) == ERROR_SUCCESS &&
+            val.CStatus == ERROR_SUCCESS && val.doubleValue > 0.0) {
+            outPkgWatts = val.doubleValue / 1000.0; // mW -> W
+        }
+    }
+}
 
 void PortMonitor::PollOnce() {
     uint64_t nowMs  = GetTickCount64();
@@ -253,19 +312,28 @@ bool PortMonitor::GetPortById(const std::wstring& id, PortInfo& outPort) const {
 }
 
 // ============================================================================
-// 1. POWER / CHARGING PORTS (Read-Only Battery IOCTL & SystemBatteryState)
+// 1. POWER / CHARGING PORTS (Read-Only Battery IOCTL + ACPI/RAPL Power Meters)
 // ============================================================================
 void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
     bool foundBattery = false;
 
+    double acpiMeterW = 0.0;
+    double raplPkgW   = 0.0;
+    SamplePowerMeters(acpiMeterW, raplPkgW);
+
+    // GUID_DEVICE_BATTERY = {72631E54-78A4-11D0-BCF7-00AA00B7B32A}
+    static const GUID kGuidDeviceBattery = {
+        0x72631e54, 0x78a4, 0x11d0, { 0xbc, 0xf7, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a }
+    };
+
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(
-        &GUID_DEVCLASS_BATTERY, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        &kGuidDeviceBattery, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 
     if (hDevInfo != INVALID_HANDLE_VALUE) {
         for (DWORD idx = 0; idx < 8; ++idx) {
             SP_DEVICE_INTERFACE_DATA did{};
             did.cbSize = sizeof(did);
-            if (!SetupDiEnumDeviceInterfaces(hDevInfo, nullptr, &GUID_DEVCLASS_BATTERY, idx, &did)) {
+            if (!SetupDiEnumDeviceInterfaces(hDevInfo, nullptr, &kGuidDeviceBattery, idx, &did)) {
                 break;
             }
 
@@ -360,24 +428,57 @@ void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
                     p.current.hasDataFro   = false;
                     p.dataNote = L"Power-only port";
 
-                    if (bs.Rate != static_cast<LONG>(BATTERY_UNKNOWN_RATE)) {
-                        double watts = std::fabs(static_cast<double>(bs.Rate)) / 1000.0;
-                        p.current.hasPower = true;
-                        p.current.powerWatts = watts;
-                        if (charging || bs.Rate > 0) {
-                            p.current.powerDir = PowerDirection::Accepted;
-                            p.powerNote = L"Live Power Accepted (Charging)";
-                        } else if (discharging || bs.Rate < 0) {
-                            p.current.powerDir = PowerDirection::Delivered;
-                            p.powerNote = L"Live Power Delivered (System Draw)";
+                    bool hasBatRate = (bs.Rate != static_cast<LONG>(BATTERY_UNKNOWN_RATE));
+                    double batWatts = hasBatRate ? (std::fabs(static_cast<double>(bs.Rate)) / 1000.0) : 0.0;
+
+                    if (onAc) {
+                        // Adapter is plugged in -> Power Accepted into the computer
+                        if (acpiMeterW > 0.0) {
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = acpiMeterW;
+                            p.current.powerDir   = PowerDirection::Accepted;
+                            p.powerNote = L"Live ACPI Power Meter (Adapter Input)";
+                        } else if (hasBatRate && (charging || bs.Rate > 0) && batWatts > 0.01) {
+                            // Adapter supplies battery charge + live CPU/SoC load
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = batWatts + raplPkgW;
+                            p.current.powerDir   = PowerDirection::Accepted;
+                            p.powerNote = (raplPkgW > 0.01)
+                                ? L"Live AC Input (Battery Charge + SoC Package Draw)"
+                                : L"Live Battery Charge Rate (AC Adapter Input)";
+                        } else if (raplPkgW > 0.01) {
+                            // Battery is full/idle on AC; adapter powers the system directly
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = raplPkgW;
+                            p.current.powerDir   = PowerDirection::Accepted;
+                            p.powerNote = L"Live AC Input (Battery Full; SoC Package Power)";
+                        } else if (hasBatRate) {
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = batWatts;
+                            p.current.powerDir   = PowerDirection::Accepted;
+                            p.powerNote = L"AC Online (Battery Full / Idle)";
                         } else {
-                            p.current.powerDir = onAc ? PowerDirection::Accepted : PowerDirection::Delivered;
-                            p.powerNote = L"Idle / Trickle";
+                            p.current.hasPower = false;
+                            p.current.powerDir = PowerDirection::None;
+                            p.powerNote = L"Wattage sensor not reported";
                         }
                     } else {
-                        p.current.hasPower = false;
-                        p.current.powerDir = PowerDirection::None;
-                        p.powerNote = L"Wattage sensor not reported";
+                        // Running on Battery -> Power Delivered
+                        if (hasBatRate && batWatts > 0.01) {
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = batWatts;
+                            p.current.powerDir   = PowerDirection::Delivered;
+                            p.powerNote = L"Live Battery Discharge (System Power Draw)";
+                        } else if (raplPkgW > 0.01) {
+                            p.current.hasPower   = true;
+                            p.current.powerWatts = raplPkgW;
+                            p.current.powerDir   = PowerDirection::Delivered;
+                            p.powerNote = L"Live SoC Package Power Draw";
+                        } else {
+                            p.current.hasPower = false;
+                            p.current.powerDir = PowerDirection::None;
+                            p.powerNote = L"Wattage sensor not reported";
+                        }
                     }
 
                     out.push_back(std::move(p));
@@ -389,7 +490,7 @@ void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
     }
 
     if (!foundBattery) {
-        // Desktop PC or fallback via SystemPowerStatus / CallNtPowerInformation
+        // Desktop PC or fallback via SystemPowerStatus / CallNtPowerInformation / Power Meters
         SYSTEM_POWER_STATUS sps{};
         SYSTEM_BATTERY_STATE sbs{};
         bool hasNt = (CallNtPowerInformation(SystemBatteryState, nullptr, 0, &sbs, sizeof(sbs)) == 0);
@@ -402,19 +503,29 @@ void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
         p.active = (sps.ACLineStatus == 1);
         p.connectedDevice = p.active ? L"Mains AC Power Supply" : L"N/A";
         p.statusText = p.active ? L"AC Online" : L"Unused";
-        p.hardwareSpec = L"Desktop PSU (No Wattage Sensor)";
+        p.hardwareSpec = L"System Power Telemetry";
         p.current.timestampSec = nowSec;
 
-        if (hasNt && sbs.BatteryPresent && sbs.Rate != 0 && sbs.Rate != static_cast<DWORD>(BATTERY_UNKNOWN_RATE)) {
+        if (acpiMeterW > 0.0) {
+            p.current.hasPower   = true;
+            p.current.powerWatts = acpiMeterW;
+            p.current.powerDir   = PowerDirection::Accepted;
+            p.powerNote = L"Live ACPI Power Meter (AC Input)";
+        } else if (hasNt && sbs.BatteryPresent && sbs.Rate != 0 && sbs.Rate != static_cast<DWORD>(BATTERY_UNKNOWN_RATE)) {
             LONG signedRate = static_cast<LONG>(sbs.Rate);
             p.current.hasPower = true;
             p.current.powerWatts = std::fabs(static_cast<double>(signedRate)) / 1000.0;
             p.current.powerDir = (signedRate > 0 || sbs.Charging) ? PowerDirection::Accepted : PowerDirection::Delivered;
             p.powerNote = L"Live System Battery Sensor";
+        } else if (p.active && raplPkgW > 0.01) {
+            p.current.hasPower   = true;
+            p.current.powerWatts = raplPkgW;
+            p.current.powerDir   = PowerDirection::Accepted;
+            p.powerNote = L"Live AC Input (CPU/SoC Package Power)";
         } else {
             p.current.hasPower = false;
             p.current.powerDir = PowerDirection::None;
-            p.powerNote = L"Desktop PSU does not expose wattage telemetry";
+            p.powerNote = L"PSU does not expose wattage telemetry";
         }
         p.dataNote = L"Power-only port";
         out.push_back(std::move(p));
