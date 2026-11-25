@@ -245,7 +245,7 @@ void PortMonitor::SamplePowerMeters(double& outAcpiMeterWatts, double& outPkgWat
 
 void PortMonitor::PollOnce() {
     uint64_t nowMs  = GetTickCount64();
-    uint64_t nowSec = (nowMs - startTickMs_) / 1000ULL;
+    uint64_t nowSec = nowMs - startTickMs_;
 
     std::vector<PortInfo> polled;
     polled.reserve(64);
@@ -423,7 +423,7 @@ void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
                     else if (onAc)        p.statusText = L"AC Online";
                     else                  p.statusText = L"Active";
 
-                    p.current.timestampSec = nowSec;
+                    p.current.timestampMs = nowSec;
                     p.current.hasDataTo    = false;
                     p.current.hasDataFro   = false;
                     p.dataNote = L"Power-only port";
@@ -504,7 +504,7 @@ void PortMonitor::PollPowerPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
         p.connectedDevice = p.active ? L"Mains AC Power Supply" : L"N/A";
         p.statusText = p.active ? L"AC Online" : L"Unused";
         p.hardwareSpec = L"System Power Telemetry";
-        p.current.timestampSec = nowSec;
+        p.current.timestampMs = nowSec;
 
         if (acpiMeterW > 0.0) {
             p.current.hasPower   = true;
@@ -741,7 +741,7 @@ void PortMonitor::EnumerateUsbHub(
         swprintf_s(nameBuf, L"USB Port %d (%s, P%lu)", globalPortCounter++, hubLabel.c_str(), portIdx);
         p.name = nameBuf;
         p.category = PortCategory::USB;
-        p.current.timestampSec = nowSec;
+        p.current.timestampMs = nowSec;
 
         bool connected = (conn->ConnectionStatus == DeviceConnected);
         p.active = connected;
@@ -852,7 +852,7 @@ void PortMonitor::PollNetworkPorts(std::vector<PortInfo>& out, uint64_t nowSec, 
         std::wstring desc(row.Description);
         p.name = alias.empty() ? desc : alias;
         p.category = PortCategory::Network;
-        p.current.timestampSec = nowSec;
+        p.current.timestampMs = nowSec;
 
         bool isUp = (row.OperStatus == IfOperStatusUp);
         p.active = isUp;
@@ -952,7 +952,7 @@ void PortMonitor::PollDisplayPorts(std::vector<PortInfo>& out, uint64_t nowSec) 
         p.name = nameBuf;
         p.category = PortCategory::Display;
         p.active = isActive;
-        p.current.timestampSec = nowSec;
+        p.current.timestampMs = nowSec;
 
         if (!isActive) {
             p.statusText      = L"Unused";
@@ -1052,7 +1052,7 @@ void PortMonitor::PollAudioPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
             p.id = std::wstring(L"audio:") + (devId ? devId : std::to_wstring(i));
             p.name = (isOutput ? L"Audio Out: " : L"Audio In: ") + friendlyName;
             p.category = PortCategory::Audio;
-            p.current.timestampSec = nowSec;
+            p.current.timestampMs = nowSec;
 
             bool active = (state == DEVICE_STATE_ACTIVE);
             p.active = active;
@@ -1149,7 +1149,7 @@ void PortMonitor::PollSerialPorts(std::vector<PortInfo>& out, uint64_t nowSec) {
         p.statusText = L"Available";
         p.connectedDevice = valName;
         p.hardwareSpec = L"RS-232 / Virtual COM";
-        p.current.timestampSec = nowSec;
+        p.current.timestampMs = nowSec;
         p.current.hasDataTo  = false;
         p.current.hasDataFro = false;
         p.current.hasPower   = false;

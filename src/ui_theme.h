@@ -39,6 +39,8 @@ struct ThemePalette {
     D2D1_COLOR_F seriesPowerDelFill;
     D2D1_COLOR_F seriesPowerAcc;     // Power Accepted (In / Charging)
     D2D1_COLOR_F seriesPowerAccFill;
+    D2D1_COLOR_F seriesTemp;         // Temperature (Celsius)
+    D2D1_COLOR_F seriesTempFill;
 
     D2D1_COLOR_F tooltipBg;
     D2D1_COLOR_F tooltipBorder;
@@ -87,6 +89,8 @@ inline ThemePalette MakeDarkTheme() {
     t.seriesPowerDelFill = Rgb(0xFB923C, 0.20f);
     t.seriesPowerAcc     = Rgb(0xA78BFA); // Violet
     t.seriesPowerAccFill = Rgb(0xA78BFA, 0.20f);
+    t.seriesTemp         = Rgb(0xF43F5E); // Rose Red
+    t.seriesTempFill     = Rgb(0xF43F5E, 0.18f);
 
     t.tooltipBg          = Rgb(0x0F172A, 0.95f);
     t.tooltipBorder      = Rgb(0x3B82F6, 0.70f);
@@ -127,6 +131,8 @@ inline ThemePalette MakeLightTheme() {
     t.seriesPowerDelFill = Rgb(0xEA580C, 0.16f);
     t.seriesPowerAcc     = Rgb(0x7C3AED); // Deep Violet
     t.seriesPowerAccFill = Rgb(0x7C3AED, 0.16f);
+    t.seriesTemp         = Rgb(0xE11D48); // Deep Rose Red
+    t.seriesTempFill     = Rgb(0xE11D48, 0.15f);
 
     t.tooltipBg          = Rgb(0xFFFFFF, 0.96f);
     t.tooltipBorder      = Rgb(0x2563EB, 0.65f);
@@ -134,3 +140,4 @@ inline ThemePalette MakeLightTheme() {
 }
 
 } // namespace porttool
+

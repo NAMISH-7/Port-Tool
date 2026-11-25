@@ -10,6 +10,7 @@
 #include <objbase.h>
 
 #include "port_monitor.h"
+#include "system_monitor.h"
 #include "app_ui.h"
 
 #include <atomic>
@@ -20,11 +21,12 @@ namespace {
 constexpr UINT WM_PORTS_UPDATED = WM_APP + 1;
 
 struct AppContext {
-    porttool::PortMonitor monitor;
-    porttool::AppUI       ui;
-    std::atomic<bool>     running{true};
-    std::thread           pollThread;
-    bool                  trackingMouse = false;
+    porttool::PortMonitor   portMonitor;
+    porttool::SystemMonitor sysMonitor;
+    porttool::AppUI         ui;
+    std::atomic<bool>       running{true};
+    std::thread             pollThread;
+    bool                    trackingMouse = false;
 };
 
 float GetDpiScale(HWND hwnd) {
@@ -61,7 +63,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_PORTS_UPDATED:
             if (ctx) {
-                ctx->ui.UpdateData(ctx->monitor.GetSnapshot());
+                ctx->ui.UpdateData(ctx->portMonitor.GetSnapshot(), ctx->sysMonitor.GetSnapshot());
             }
             return 0;
 
@@ -161,14 +163,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Background 1 Hz read-only polling thread
+    // Background 2 Hz (0.5 sec) read-only polling thread
     ctx.pollThread = std::thread([&ctx, hwnd]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         while (ctx.running.load(std::memory_order_relaxed)) {
-            ctx.monitor.PollOnce();
+            uint64_t t0 = GetTickCount64();
+            ctx.portMonitor.PollOnce();
+            ctx.sysMonitor.PollOnce();
             PostMessageW(hwnd, WM_PORTS_UPDATED, 0, 0);
-            for (int i = 0; i < 10 && ctx.running.load(std::memory_order_relaxed); ++i) {
-                Sleep(100);
+
+            uint64_t elapsed = GetTickCount64() - t0;
+            uint64_t remain  = (elapsed < porttool::kSampleIntervalMs) ? (porttool::kSampleIntervalMs - elapsed) : 0;
+            while (remain > 0 && ctx.running.load(std::memory_order_relaxed)) {
+                DWORD step = static_cast<DWORD>(remain > 50 ? 50 : remain);
+                Sleep(step);
+                remain -= step;
             }
         }
         CoUninitialize();
@@ -189,3 +198,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     CoUninitialize();
     return 0;
 }
+
