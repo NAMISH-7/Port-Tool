@@ -12,6 +12,7 @@
 
 #include "port_monitor.h"
 #include "system_monitor.h"
+#include "telemetry_logger.h"
 #include "app_ui.h"
 
 #include <atomic>
@@ -28,14 +29,15 @@ constexpr UINT kCmdTrayOpen      = 2001;
 constexpr UINT kCmdTrayExit      = 2002;
 
 struct AppContext {
-    porttool::PortMonitor   portMonitor;
-    porttool::SystemMonitor sysMonitor;
-    porttool::AppUI         ui;
-    std::atomic<bool>       running{true};
-    std::thread             pollThread;
-    bool                    trackingMouse = false;
-    bool                    trayAdded     = false;
-    NOTIFYICONDATAW         nid{};
+    porttool::PortMonitor       portMonitor;
+    porttool::SystemMonitor     sysMonitor;
+    porttool::TelemetryRecorder recorder;
+    porttool::AppUI             ui;
+    std::atomic<bool>           running{true};
+    std::thread                 pollThread;
+    bool                        trackingMouse = false;
+    bool                        trayAdded     = false;
+    NOTIFYICONDATAW             nid{};
 };
 
 void AddTrayIcon(HWND hwnd, AppContext* ctx) {
@@ -262,6 +264,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         CoUninitialize();
         return 1;
     }
+    ctx.ui.AttachRecorder(&ctx.recorder);
 
     AddTrayIcon(hwnd, &ctx);
     if (startMinimized) {
@@ -272,13 +275,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     }
     SetTimer(hwnd, 1, 33, nullptr); // 30 FPS refresh ONLY when viewing live audio waveform
 
-    // Background live read-only polling thread (respects Settings sample rate)
+    // Background live read-only polling + continuous crash-safe recording thread
+    // Keeps capturing live data uninterrupted even while viewing old logs in History & Logs!
     ctx.pollThread = std::thread([&ctx, hwnd]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         while (ctx.running.load(std::memory_order_relaxed)) {
             uint64_t t0 = GetTickCount64();
             ctx.portMonitor.PollOnce();
             ctx.sysMonitor.PollOnce();
+            ctx.recorder.RecordSnapshot(ctx.portMonitor.GetSnapshot(), ctx.sysMonitor.GetSnapshot());
             PostMessageW(hwnd, WM_PORTS_UPDATED, 0, 0);
 
             uint64_t targetMs = ctx.ui.GetSampleIntervalMs();
@@ -290,6 +295,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
                 remain -= step;
             }
         }
+        ctx.recorder.Shutdown();
         CoUninitialize();
     });
 

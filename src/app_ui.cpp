@@ -1,9 +1,11 @@
 #include "app_ui.h"
 
 #include <dwmapi.h>
+#include <shobjidl.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <tuple>
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -105,12 +107,170 @@ void SaveMinimizeToTrayPref(bool enable) {
     }
 }
 
+void LoadLoggingPrefs(bool& outEnabled, uint32_t& outMaxHours, std::wstring& outDir) {
+    outEnabled  = true;
+    outMaxHours = 24;
+    outDir      = TelemetryRecorder::GetDefaultStorageDir();
+
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kAppPrefKeyPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD val = 1, sz = sizeof(val);
+    if (RegQueryValueExW(hKey, L"CaptureEnabled", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS) {
+        outEnabled = (val != 0);
+    }
+    sz = sizeof(val);
+    if (RegQueryValueExW(hKey, L"CaptureMaxHours", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS) {
+        outMaxHours = std::clamp<uint32_t>(val, 1, 24);
+    }
+    wchar_t dirBuf[MAX_PATH * 2]{};
+    DWORD dirBytes = sizeof(dirBuf);
+    if (RegQueryValueExW(hKey, L"CaptureLogDir", nullptr, nullptr, reinterpret_cast<LPBYTE>(dirBuf), &dirBytes) == ERROR_SUCCESS && dirBuf[0]) {
+        outDir = dirBuf;
+    }
+    RegCloseKey(hKey);
+}
+
+void SaveLoggingPrefs(bool enabled, uint32_t maxHours, const std::wstring& dir) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kAppPrefKeyPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        DWORD en = enabled ? 1u : 0u;
+        DWORD hr = std::clamp<uint32_t>(maxHours, 1, 24);
+        RegSetValueExW(hKey, L"CaptureEnabled",  0, REG_DWORD, reinterpret_cast<const BYTE*>(&en), sizeof(en));
+        RegSetValueExW(hKey, L"CaptureMaxHours", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&hr), sizeof(hr));
+        if (!dir.empty()) {
+            DWORD bytes = static_cast<DWORD>((dir.size() + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"CaptureLogDir", 0, REG_SZ, reinterpret_cast<const BYTE*>(dir.c_str()), bytes);
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+std::wstring PickFolderDialog(HWND owner, const std::wstring& initialDir) {
+    std::wstring chosen;
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&dlg))) && dlg) {
+        DWORD opts = 0;
+        dlg->GetOptions(&opts);
+        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        dlg->SetTitle(L"Select Telemetry Data Storage Folder");
+
+        if (!initialDir.empty()) {
+            IShellItem* initItem = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(initialDir.c_str(), nullptr, IID_PPV_ARGS(&initItem))) && initItem) {
+                dlg->SetFolder(initItem);
+                initItem->Release();
+            }
+        }
+        if (SUCCEEDED(dlg->Show(owner))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                    chosen = path;
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+        }
+        dlg->Release();
+    }
+    return chosen;
+}
+
+std::wstring PickLogFileDialog(HWND owner, const std::wstring& initialDir) {
+    std::wstring chosen;
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&dlg))) && dlg) {
+        COMDLG_FILTERSPEC filters[] = {
+            { L"Port Tool Telemetry Logs (*.ptlog)", L"*.ptlog" },
+            { L"All Files (*.*)", L"*.*" }
+        };
+        dlg->SetFileTypes(2, filters);
+        dlg->SetTitle(L"Open Port Tool Telemetry Log");
+
+        if (!initialDir.empty()) {
+            IShellItem* initItem = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(initialDir.c_str(), nullptr, IID_PPV_ARGS(&initItem))) && initItem) {
+                dlg->SetFolder(initItem);
+                initItem->Release();
+            }
+        }
+        if (SUCCEEDED(dlg->Show(owner))) {
+            IShellItem* item = nullptr;
+            if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                PWSTR path = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                    chosen = path;
+                    CoTaskMemFree(path);
+                }
+                item->Release();
+            }
+        }
+        dlg->Release();
+    }
+    return chosen;
+}
+
+std::wstring FormatEpochTime(int64_t epochSec) {
+    if (epochSec <= 0) return L"--:--:--";
+    std::time_t tt = static_cast<std::time_t>(epochSec);
+    struct tm lt{};
+    localtime_s(&lt, &tt);
+    wchar_t buf[32];
+    swprintf_s(buf, L"%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
+    return buf;
+}
+
+std::wstring FormatDurationSec(int64_t sec) {
+    if (sec < 0) sec = 0;
+    int64_t h = sec / 3600;
+    int64_t m = (sec % 3600) / 60;
+    int64_t s = sec % 60;
+    wchar_t buf[48];
+    if (h > 0)      swprintf_s(buf, L"%lldh %02lldm %02llds", h, m, s);
+    else if (m > 0) swprintf_s(buf, L"%lldm %02llds", m, s);
+    else            swprintf_s(buf, L"%llds", s);
+    return buf;
+}
+
 } // namespace
 
 AppUI::AppUI() {
     theme_            = MakeDarkTheme();
     startWithWindows_ = QueryStartWithWindows();
     minimizeToTray_   = LoadMinimizeToTrayPref();
+    LoadLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+}
+
+void AppUI::AttachRecorder(TelemetryRecorder* recorder) {
+    recorder_ = recorder;
+    SyncRecorderConfig();
+}
+
+void AppUI::SyncRecorderConfig() {
+    if (recorder_) {
+        recorder_->Configure(captureLogEnabled_, captureLogDir_, captureMaxHours_);
+    }
+}
+
+void AppUI::RefreshHistoryFileList() {
+    histFiles_ = TelemetryRecorder::ListLogFiles(captureLogDir_);
+    if (!histLoaded_ && !histFiles_.empty()) {
+        LoadHistoryFile(histFiles_[0].fullPath);
+    }
+}
+
+void AppUI::LoadHistoryFile(const std::wstring& path) {
+    LoadedLogSession loaded{};
+    if (TelemetryRecorder::LoadLogFile(path, loaded)) {
+        histSession_        = std::move(loaded);
+        histLoaded_         = true;
+        histSelectedEntity_ = -1;
+    }
 }
 
 AppUI::~AppUI() {
@@ -295,6 +455,11 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
                     activeTab_ = kTabSystem;
                     menuOpen_  = false;
                     break;
+                case kActSwitchTabHistory:
+                    activeTab_ = kTabHistory;
+                    menuOpen_  = false;
+                    RefreshHistoryFileList();
+                    break;
                 case kActSwitchTabSettings:
                     activeTab_ = kTabSettings;
                     menuOpen_  = false;
@@ -341,6 +506,59 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
                 case kActToggleMinimizeToTray:
                     minimizeToTray_ = !minimizeToTray_;
                     SaveMinimizeToTrayPref(minimizeToTray_);
+                    break;
+                case kActToggleCaptureLog:
+                    captureLogEnabled_ = !captureLogEnabled_;
+                    SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                    SyncRecorderConfig();
+                    break;
+                case kActSetLogHrs1:
+                    captureMaxHours_ = 1;
+                    SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                    SyncRecorderConfig();
+                    break;
+                case kActSetLogHrs6:
+                    captureMaxHours_ = 6;
+                    SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                    SyncRecorderConfig();
+                    break;
+                case kActSetLogHrs12:
+                    captureMaxHours_ = 12;
+                    SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                    SyncRecorderConfig();
+                    break;
+                case kActSetLogHrs24:
+                    captureMaxHours_ = 24;
+                    SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                    SyncRecorderConfig();
+                    break;
+                case kActChooseLogFolder: {
+                    std::wstring picked = PickFolderDialog(hwnd_, captureLogDir_);
+                    if (!picked.empty()) {
+                        captureLogDir_ = picked;
+                        SaveLoggingPrefs(captureLogEnabled_, captureMaxHours_, captureLogDir_);
+                        SyncRecorderConfig();
+                    }
+                    break;
+                }
+                case kActHistRefresh:
+                    RefreshHistoryFileList();
+                    if (histLoaded_ && !histSession_.filePath.empty()) {
+                        LoadHistoryFile(histSession_.filePath);
+                    }
+                    break;
+                case kActHistBrowseFile: {
+                    std::wstring picked = PickLogFileDialog(hwnd_, captureLogDir_);
+                    if (!picked.empty()) {
+                        LoadHistoryFile(picked);
+                    }
+                    break;
+                }
+                case kActHistLoadFile:
+                    LoadHistoryFile(it->payload);
+                    break;
+                case kActHistSelectEntity:
+                    histSelectedEntity_ = std::stoi(it->payload);
                     break;
                 case kActFilterAll:
                     categoryFilter_ = -1;
@@ -412,6 +630,10 @@ void AppUI::OnMouseWheel(int delta) {
     } else if (activeTab_ == kTabSystem && !inSysDetailView_) {
         sysScrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
         sysScrollY_ = std::clamp(sysScrollY_, 0.0f, sysMaxScrollY_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    } else if (activeTab_ == kTabHistory) {
+        histFileScrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
+        histFileScrollY_ = std::clamp(histFileScrollY_, 0.0f, histFileMaxScrollY_);
         InvalidateRect(hwnd_, nullptr, FALSE);
     } else if (activeTab_ == kTabSettings) {
         settingsScrollY_ -= (static_cast<float>(delta) / 120.0f) * 48.0f;
@@ -505,6 +727,8 @@ void AppUI::Render() {
     } else if (activeTab_ == kTabSystem) {
         if (inSysDetailView_) DrawSystemDetailPage(w, h);
         else                  DrawSystemMainPage(w, h);
+    } else if (activeTab_ == kTabHistory) {
+        DrawHistoryPage(w, h);
     } else {
         DrawSettingsPage(w, h);
     }
@@ -567,11 +791,13 @@ void AppUI::DrawTopBar(float width) {
                  activeTab_ == kTabSystem ? theme_.textOnAccent : theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
     hitButtons_.push_back({tabSys, kActSwitchTabSystem, L""});
 
-    // Read-Only Guarantee Badge
-    if (width > 790.0f) {
-        D2D1_RECT_F roRect = D2D1::RectF(width - 278.0f, 16.0f, width - 160.0f, 40.0f);
+    // Live Recording Indicator + Read-Only Badge
+    if (width > 820.0f) {
+        bool recLive = (recorder_ && recorder_->IsActivelyWriting());
+        D2D1_RECT_F roRect = D2D1::RectF(width - 284.0f, 16.0f, width - 160.0f, 40.0f);
         DrawRoundedRect(roRect, 12.0f, theme_.bgBadgeActive, D2D1::ColorF(0, 0, 0, 0), 0.0f);
-        DrawTextLine(L"Read-Only Mode", roRect, fmtSmall_, theme_.statusActive, DWRITE_TEXT_ALIGNMENT_CENTER);
+        DrawTextLine(recLive ? L"Rec Live | RO" : L"Read-Only Mode", roRect, fmtSmall_,
+                     theme_.statusActive, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     // Theme Toggle Button (Right aligned)
@@ -618,7 +844,8 @@ void AppUI::DrawBurgerMenuOverlay(float width, float height) {
     const NavItem items[] = {
         { L"Ports",           L"USB, Network, Power, Display, Audio", kTabPorts,    kActSwitchTabPorts },
         { L"System Hardware", L"CPU, GPU(s), Disk(s), Memory, Temps", kTabSystem,   kActSwitchTabSystem },
-        { L"Settings",        L"Theme, Units, Sample Rate, Audio",    kTabSettings, kActSwitchTabSettings }
+        { L"History & Logs",  L"View saved 1-24h charts & data flows",kTabHistory,  kActSwitchTabHistory },
+        { L"Settings",        L"Capture, Folder, Startup, Theme",     kTabSettings, kActSwitchTabSettings }
     };
 
     float iy = 72.0f;
@@ -645,6 +872,445 @@ void AppUI::DrawBurgerMenuOverlay(float width, float height) {
                  fmtSmall_, theme_.textMuted);
 }
 
+void AppUI::DrawHistoryPage(float width, float height) {
+    constexpr float kPad     = 18.0f;
+    constexpr float kSideW   = 244.0f;
+    float topY = 70.0f;
+
+    // Left Sidebar: Saved .ptlog Files + Refresh + Open File...
+    D2D1_RECT_F sideBox = D2D1::RectF(kPad, topY, kPad + kSideW, height - 16.0f);
+    DrawRoundedRect(sideBox, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+
+    DrawTextLine(L"Saved Logs", D2D1::RectF(sideBox.left + 12, sideBox.top + 8, sideBox.right - 12, sideBox.top + 30),
+                 fmtHeading_, theme_.textPrimary);
+
+    // Live background capture status pill
+    bool recLive = (recorder_ && recorder_->IsActivelyWriting());
+    D2D1_RECT_F recPill = D2D1::RectF(sideBox.left + 12, sideBox.top + 32, sideBox.right - 12, sideBox.top + 52);
+    DrawRoundedRect(recPill, 8.0f, recLive ? theme_.bgBadgeActive : theme_.bgBadgeUnused, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+    DrawTextLine(recLive ? L"Live capture active in background" : L"Live capture paused (Settings)",
+                 recPill, fmtSmall_, recLive ? theme_.statusActive : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // Action buttons: Refresh | Open File...
+    float btnY = sideBox.top + 60.0f;
+    D2D1_RECT_F refBtn  = D2D1::RectF(sideBox.left + 12, btnY, sideBox.left + 114, btnY + 28.0f);
+    D2D1_RECT_F openBtn = D2D1::RectF(sideBox.left + 122, btnY, sideBox.right - 12, btnY + 28.0f);
+    bool hovRef  = !menuOpen_ && mouseInside_ && PtInRectF(refBtn,  mouseX_, mouseY_);
+    bool hovOpen = !menuOpen_ && mouseInside_ && PtInRectF(openBtn, mouseX_, mouseY_);
+    DrawRoundedRect(refBtn,  7.0f, hovRef  ? theme_.bgSurfaceHover : theme_.bgPillIdle, theme_.border, 1.0f);
+    DrawRoundedRect(openBtn, 7.0f, hovOpen ? theme_.bgSurfaceHover : theme_.bgPillIdle, theme_.border, 1.0f);
+    DrawTextLine(L"Refresh",      refBtn,  fmtSmall_, theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextLine(L"Open File...", openBtn, fmtSmall_, theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    hitButtons_.push_back({refBtn,  kActHistRefresh,    L""});
+    hitButtons_.push_back({openBtn, kActHistBrowseFile, L""});
+
+    float listTop = btnY + 38.0f;
+    brush_->SetColor(theme_.border);
+    rt_->DrawLine(D2D1::Point2F(sideBox.left, listTop - 4.0f), D2D1::Point2F(sideBox.right, listTop - 4.0f), brush_, 1.0f);
+
+    float listH = std::max(40.0f, sideBox.bottom - listTop - 8.0f);
+    constexpr float kItemH = 48.0f;
+    histFileMaxScrollY_ = std::max(0.0f, static_cast<float>(histFiles_.size()) * kItemH - listH);
+    histFileScrollY_    = std::clamp(histFileScrollY_, 0.0f, histFileMaxScrollY_);
+
+    rt_->PushAxisAlignedClip(D2D1::RectF(sideBox.left + 2, listTop, sideBox.right - 2, sideBox.bottom - 4),
+                             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    if (histFiles_.empty()) {
+        DrawTextLine(L"No .ptlog files yet.",
+                     D2D1::RectF(sideBox.left + 12, listTop + 16, sideBox.right - 12, listTop + 44),
+                     fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        for (size_t i = 0; i < histFiles_.size(); ++i) {
+            const auto& f = histFiles_[i];
+            float iy = listTop + static_cast<float>(i) * kItemH - histFileScrollY_;
+            if (iy + kItemH < listTop || iy > sideBox.bottom) continue;
+
+            D2D1_RECT_F r = D2D1::RectF(sideBox.left + 8, iy + 2, sideBox.right - 8, iy + kItemH - 2);
+            bool selected = (histLoaded_ && histSession_.filePath == f.fullPath);
+            bool hover    = !menuOpen_ && mouseInside_ && PtInRectF(r, mouseX_, mouseY_) && mouseY_ >= listTop;
+            D2D1_COLOR_F bg = selected ? theme_.bgPillActive : (hover ? theme_.bgSurfaceHover : theme_.bgWindow);
+            DrawRoundedRect(r, 7.0f, bg, selected ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
+
+            // Short label without "PortTool_" prefix & ".ptlog" suffix
+            std::wstring label = f.fileName;
+            if (label.rfind(L"PortTool_", 0) == 0) label = label.substr(9);
+            if (label.size() > 6 && label.substr(label.size() - 6) == L".ptlog") label.resize(label.size() - 6);
+
+            DrawTextLine(label, D2D1::RectF(r.left + 8, r.top + 4, r.right - 8, r.top + 22),
+                         fmtSmall_, selected ? theme_.textOnAccent : theme_.textPrimary);
+            DrawTextLine(FormatBytesSize(static_cast<double>(f.sizeBytes)),
+                         D2D1::RectF(r.left + 8, r.top + 22, r.right - 8, r.bottom - 4),
+                         fmtSmall_, selected ? D2D1::ColorF(1, 1, 1, 0.80f) : theme_.textMuted);
+
+            D2D1_RECT_F hitR = D2D1::RectF(r.left, std::max(r.top, listTop), r.right, std::min(r.bottom, sideBox.bottom));
+            if (hitR.bottom > hitR.top) {
+                hitButtons_.push_back({hitR, kActHistLoadFile, f.fullPath});
+            }
+        }
+    }
+    rt_->PopAxisAlignedClip();
+
+    // Right Main Panel: Full-Period Graphs, KPIs & Data/Power Flow Breakdown
+    float mainL = sideBox.right + 14.0f;
+    float mainR = width - kPad;
+    float mainW = std::max(300.0f, mainR - mainL);
+
+    if (!histLoaded_) {
+        D2D1_RECT_F emptyBox = D2D1::RectF(mainL, topY, mainR, height - 16.0f);
+        DrawRoundedRect(emptyBox, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+        DrawTextLine(L"Select a saved .ptlog file on the left (or click Open File...) to inspect full-period charts & flows",
+                     emptyBox, fmtHeading_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    float y = topY;
+
+    // 1. Session Summary KPI Strip
+    float kpiGap = 10.0f;
+    float kpiW   = (mainW - kpiGap * 3.0f) / 4.0f;
+    float kpiH   = 60.0f;
+
+    int64_t durSec = std::max<int64_t>(0, histSession_.endEpochSec - histSession_.startEpochSec);
+    struct KpiItem { std::wstring label; std::wstring value; D2D1_COLOR_F col; };
+    std::vector<KpiItem> kpis = {
+        { L"Recorded Period (" + FormatEpochTime(histSession_.startEpochSec) + L" - " + FormatEpochTime(histSession_.endEpochSec) + L")",
+          FormatDurationSec(durSec), theme_.textPrimary },
+        { L"Peak CPU / Peak Temp",
+          FormatPercent(histSession_.peakCpuPct, true) + L"  |  " + FormatTempC(histSession_.peakTempC, histSession_.hasPeakTemp, useFahrenheit_),
+          theme_.seriesTemp },
+        { L"Peak Power",
+          FormatPowerPlain(histSession_.peakPowerW, histSession_.hasPeakPower),
+          theme_.seriesPowerDel },
+        { L"Total Port Data (To + Fro)",
+          FormatBytesSize(histSession_.totalPortToB + histSession_.totalPortFroB),
+          theme_.seriesTo }
+    };
+
+    for (size_t i = 0; i < kpis.size(); ++i) {
+        float x = mainL + static_cast<float>(i) * (kpiW + kpiGap);
+        D2D1_RECT_F c = D2D1::RectF(x, y, x + kpiW, y + kpiH);
+        DrawRoundedRect(c, 9.0f, theme_.bgSurface, theme_.border, 1.0f);
+        DrawTextLine(kpis[i].label, D2D1::RectF(x + 10, y + 6,  x + kpiW - 10, y + 24), fmtSmall_, theme_.textSecondary);
+        DrawTextLine(kpis[i].value, D2D1::RectF(x + 10, y + 26, x + kpiW - 10, y + 54), fmtHeading_, kpis[i].col);
+    }
+
+    y += kpiH + 10.0f;
+
+    // 2. Scope Selector Pills (Overview + top recorded entities)
+    float px = mainL;
+    auto drawScopePill = [&](const std::wstring& label, int entIdx) {
+        float pw = std::clamp(static_cast<float>(label.size()) * 7.2f + 22.0f, 74.0f, 156.0f);
+        if (px + pw > mainR) return;
+        D2D1_RECT_F r = D2D1::RectF(px, y, px + pw, y + 26.0f);
+        bool sel = (histSelectedEntity_ == entIdx);
+        bool hov = !menuOpen_ && mouseInside_ && PtInRectF(r, mouseX_, mouseY_);
+        DrawRoundedRect(r, 13.0f, sel ? theme_.bgPillActive : (hov ? theme_.bgSurfaceHover : theme_.bgPillIdle),
+                        sel ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
+        DrawTextLine(label, r, fmtSmall_, sel ? theme_.textOnAccent : theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+        hitButtons_.push_back({r, kActHistSelectEntity, std::to_wstring(entIdx)});
+        px += pw + 6.0f;
+    };
+
+    drawScopePill(L"Overview (All)", -1);
+    for (size_t i = 0; i < histSession_.entities.size() && i < 8; ++i) {
+        drawScopePill(histSession_.entities[i].name, static_cast<int>(i));
+    }
+
+    y += 34.0f;
+
+    // 3. Charts & Visual Flows Grid
+    const std::vector<LogSeriesPoint>& activePts =
+        (histSelectedEntity_ >= 0 && histSelectedEntity_ < static_cast<int>(histSession_.entities.size()))
+            ? histSession_.entities[static_cast<size_t>(histSelectedEntity_)].points
+            : histSession_.overviewPoints;
+
+    float availH = std::max(260.0f, height - y - 16.0f);
+    float gap    = 12.0f;
+    float topH   = (availH - gap) * 0.52f;
+    float botH   = availH - gap - topH;
+    float halfW  = (mainW - gap) * 0.5f;
+
+    // Top-Left: Full-Period Data Flow Timeline (To & Fro)
+    DrawHistoryTimelineChart(D2D1::RectF(mainL, y, mainL + halfW, y + topH), activePts, true);
+    // Top-Right: Full-Period Utilization, Power & Temp Timeline
+    DrawHistoryTimelineChart(D2D1::RectF(mainL + halfW + gap, y, mainR, y + topH), activePts, false);
+    // Bottom Full: Visual Data & Power Flow Breakdown Bars
+    DrawHistoryFlowBars(D2D1::RectF(mainL, y + topH + gap, mainR, y + topH + gap + botH));
+}
+
+void AppUI::DrawHistoryTimelineChart(const D2D1_RECT_F& card, const std::vector<LogSeriesPoint>& pts, bool isDataMode) {
+    DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+
+    DrawTextLine(isDataMode ? L"Full-Period Data Flow (To & Fro)" : L"Full-Period Util / Power / Temp",
+                 D2D1::RectF(card.left + 14, card.top + 8, card.right - 165, card.top + 30),
+                 fmtHeading_, theme_.textPrimary);
+
+    // Legend
+    float lx = card.right - 162.0f;
+    if (isDataMode) {
+        brush_->SetColor(theme_.seriesTo);  rt_->FillRectangle(D2D1::RectF(lx, card.top + 15, lx + 10, card.top + 23), brush_);
+        DrawTextLine(L"To",  D2D1::RectF(lx + 14, card.top + 8, lx + 60, card.top + 30), fmtSmall_, theme_.textSecondary);
+        brush_->SetColor(theme_.seriesFro); rt_->FillRectangle(D2D1::RectF(lx + 68, card.top + 15, lx + 78, card.top + 23), brush_);
+        DrawTextLine(L"Fro", D2D1::RectF(lx + 82, card.top + 8, lx + 152, card.top + 30), fmtSmall_, theme_.textSecondary);
+    } else {
+        brush_->SetColor(theme_.seriesTo);       rt_->FillRectangle(D2D1::RectF(lx, card.top + 15, lx + 8, card.top + 23), brush_);
+        DrawTextLine(L"Util", D2D1::RectF(lx + 11, card.top + 8, lx + 48, card.top + 30), fmtSmall_, theme_.textSecondary);
+        brush_->SetColor(theme_.seriesPowerDel); rt_->FillRectangle(D2D1::RectF(lx + 50, card.top + 15, lx + 58, card.top + 23), brush_);
+        DrawTextLine(L"Pwr",  D2D1::RectF(lx + 61, card.top + 8, lx + 98, card.top + 30), fmtSmall_, theme_.textSecondary);
+        brush_->SetColor(theme_.seriesTemp);     rt_->FillRectangle(D2D1::RectF(lx + 100, card.top + 15, lx + 108, card.top + 23), brush_);
+        DrawTextLine(L"Temp", D2D1::RectF(lx + 111, card.top + 8, card.right - 6, card.top + 30), fmtSmall_, theme_.textSecondary);
+    }
+
+    D2D1_RECT_F plot = D2D1::RectF(card.left + 68.0f, card.top + 36.0f, card.right - 14.0f, card.bottom - 24.0f);
+    DrawRoundedRect(plot, 6.0f, theme_.bgChart, theme_.gridLine, 1.0f);
+
+    if (pts.size() < 2) {
+        DrawTextLine(L"Waiting for more recorded samples...", plot, fmtBody_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    float plotW = plot.right - plot.left;
+    float plotH = plot.bottom - plot.top;
+
+    // Determine Y-axis scaling
+    double yMax = 100.0;
+    bool hasAny = false;
+    if (isDataMode) {
+        double maxV = 0.0;
+        for (const auto& p : pts) {
+            if (p.hasDataTo)  { hasAny = true; maxV = std::max(maxV, p.dataToBps); }
+            if (p.hasDataFro) { hasAny = true; maxV = std::max(maxV, p.dataFroBps); }
+        }
+        yMax = NiceUpperBound(maxV * 1.15, 1024.0);
+    } else {
+        double maxV = 0.0;
+        for (const auto& p : pts) {
+            if (p.hasUtil)  { hasAny = true; maxV = std::max(maxV, p.utilPct); }
+            if (p.hasPower) { hasAny = true; maxV = std::max(maxV, p.powerW); }
+            if (p.hasTemp)  { hasAny = true; maxV = std::max(maxV, p.tempC); }
+        }
+        yMax = NiceUpperBound(std::max(maxV * 1.15, 100.0), 100.0);
+    }
+
+    if (!hasAny) {
+        DrawTextLine(L"N/A — No metrics recorded in this category", plot, fmtBody_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    for (int i = 0; i <= 4; ++i) {
+        float frac = static_cast<float>(i) / 4.0f;
+        float gy = plot.bottom - frac * plotH;
+        if (i > 0 && i < 4) {
+            brush_->SetColor(theme_.gridLine);
+            rt_->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), brush_, 1.0f);
+        }
+        std::wstring lbl;
+        if (isDataMode) {
+            lbl = FormatBytesPerSec(yMax * frac, true, useBitsPerSec_);
+        } else {
+            wchar_t b[24];
+            swprintf_s(b, L"%.0f", yMax * frac);
+            lbl = b;
+        }
+        DrawTextLine(lbl, D2D1::RectF(card.left + 4.0f, gy - 8.0f, plot.left - 6.0f, gy + 8.0f),
+                     fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // Wall-clock X-axis labels (Start, Mid, End)
+    DrawTextLine(FormatEpochTime(pts.front().epochSec), D2D1::RectF(plot.left, plot.bottom + 2, plot.left + 70, card.bottom - 2), fmtSmall_, theme_.textMuted);
+    DrawTextLine(FormatEpochTime(pts[pts.size() / 2].epochSec), D2D1::RectF(plot.left + plotW * 0.5f - 35, plot.bottom + 2, plot.left + plotW * 0.5f + 35, card.bottom - 2), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawTextLine(FormatEpochTime(pts.back().epochSec), D2D1::RectF(plot.right - 70, plot.bottom + 2, plot.right, card.bottom - 2), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+    // Downsample gracefully if there are thousands of points (24h = 43,200 points -> draw at ~360 buckets)
+    size_t n = pts.size();
+    size_t step = std::max<size_t>(1, n / 360);
+
+    auto drawCurve = [&](auto getter, const D2D1_COLOR_F& strokeCol, const D2D1_COLOR_F& fillCol) {
+        ID2D1PathGeometry* areaGeo = nullptr;
+        ID2D1PathGeometry* lineGeo = nullptr;
+        if (FAILED(d2dFactory_->CreatePathGeometry(&areaGeo)) || FAILED(d2dFactory_->CreatePathGeometry(&lineGeo))) {
+            SafeRelease(areaGeo); SafeRelease(lineGeo); return;
+        }
+        ID2D1GeometrySink* areaSink = nullptr;
+        ID2D1GeometrySink* lineSink = nullptr;
+        areaGeo->Open(&areaSink); lineGeo->Open(&lineSink);
+
+        bool inSeg = false;
+        float lastX = 0.0f;
+        for (size_t i = 0; i < n; i += step) {
+            double val = 0.0;
+            bool ok = getter(pts[i], val);
+            float px = plot.left + (static_cast<float>(i) / static_cast<float>(n - 1)) * plotW;
+            float py = plot.bottom - static_cast<float>(std::clamp(val / yMax, 0.0, 1.0)) * plotH;
+            if (ok) {
+                if (!inSeg) {
+                    areaSink->BeginFigure(D2D1::Point2F(px, plot.bottom), D2D1_FIGURE_BEGIN_FILLED);
+                    areaSink->AddLine(D2D1::Point2F(px, py));
+                    lineSink->BeginFigure(D2D1::Point2F(px, py), D2D1_FIGURE_BEGIN_HOLLOW);
+                    inSeg = true;
+                } else {
+                    areaSink->AddLine(D2D1::Point2F(px, py));
+                    lineSink->AddLine(D2D1::Point2F(px, py));
+                }
+                lastX = px;
+            } else if (inSeg) {
+                areaSink->AddLine(D2D1::Point2F(lastX, plot.bottom));
+                areaSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                lineSink->EndFigure(D2D1_FIGURE_END_OPEN);
+                inSeg = false;
+            }
+        }
+        if (inSeg) {
+            areaSink->AddLine(D2D1::Point2F(lastX, plot.bottom));
+            areaSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            lineSink->EndFigure(D2D1_FIGURE_END_OPEN);
+        }
+        areaSink->Close(); lineSink->Close();
+        SafeRelease(areaSink); SafeRelease(lineSink);
+        brush_->SetColor(fillCol);   rt_->FillGeometry(areaGeo, brush_);
+        brush_->SetColor(strokeCol); rt_->DrawGeometry(lineGeo, brush_, 1.8f);
+        SafeRelease(areaGeo); SafeRelease(lineGeo);
+    };
+
+    if (isDataMode) {
+        drawCurve([](const LogSeriesPoint& p, double& v) { v = p.dataToBps;  return p.hasDataTo;  }, theme_.seriesTo,  theme_.seriesToFill);
+        drawCurve([](const LogSeriesPoint& p, double& v) { v = p.dataFroBps; return p.hasDataFro; }, theme_.seriesFro, theme_.seriesFroFill);
+    } else {
+        drawCurve([](const LogSeriesPoint& p, double& v) { v = p.utilPct; return p.hasUtil;  }, theme_.seriesTo,       theme_.seriesToFill);
+        drawCurve([](const LogSeriesPoint& p, double& v) { v = p.powerW;  return p.hasPower; }, theme_.seriesPowerDel, theme_.seriesPowerDelFill);
+        drawCurve([](const LogSeriesPoint& p, double& v) { v = p.tempC;   return p.hasTemp;  }, theme_.seriesTemp,     theme_.seriesTempFill);
+    }
+
+    // Interactive Hover Crosshair & Wall-Clock Tooltip
+    if (!menuOpen_ && mouseInside_ && PtInRectF(plot, mouseX_, mouseY_)) {
+        float rel = std::clamp((mouseX_ - plot.left) / plotW, 0.0f, 1.0f);
+        size_t idx = std::min(n - 1, static_cast<size_t>(std::round(rel * static_cast<float>(n - 1))));
+        const auto& p = pts[idx];
+        float cx = plot.left + rel * plotW;
+
+        brush_->SetColor(theme_.borderStrong);
+        rt_->DrawLine(D2D1::Point2F(cx, plot.top), D2D1::Point2F(cx, plot.bottom), brush_, 1.0f);
+
+        float tw = 166.0f, th = isDataMode ? 58.0f : 74.0f;
+        float tx = (cx + tw + 10.0f < plot.right) ? (cx + 8.0f) : (cx - tw - 8.0f);
+        float ty = plot.top + 6.0f;
+        DrawRoundedRect(D2D1::RectF(tx, ty, tx + tw, ty + th), 6.0f, theme_.tooltipBg, theme_.tooltipBorder, 1.0f);
+        DrawTextLine(FormatEpochTime(p.epochSec), D2D1::RectF(tx + 8, ty + 4, tx + tw - 8, ty + 18), fmtSmall_, theme_.textMuted);
+
+        if (isDataMode) {
+            DrawTextLine(L"To:  " + FormatBytesPerSec(p.dataToBps,  p.hasDataTo,  useBitsPerSec_), D2D1::RectF(tx + 8, ty + 18, tx + tw - 8, ty + 36), fmtMono_, theme_.seriesTo);
+            DrawTextLine(L"Fro: " + FormatBytesPerSec(p.dataFroBps, p.hasDataFro, useBitsPerSec_), D2D1::RectF(tx + 8, ty + 36, tx + tw - 8, ty + 54), fmtMono_, theme_.seriesFro);
+        } else {
+            DrawTextLine(L"Util: " + FormatPercent(p.utilPct, p.hasUtil),                        D2D1::RectF(tx + 8, ty + 18, tx + tw - 8, ty + 36), fmtMono_, theme_.seriesTo);
+            DrawTextLine(L"Pwr:  " + FormatPowerPlain(p.powerW, p.hasPower),                     D2D1::RectF(tx + 8, ty + 36, tx + tw - 8, ty + 54), fmtMono_, theme_.seriesPowerDel);
+            DrawTextLine(L"Temp: " + FormatTempC(p.tempC, p.hasTemp, useFahrenheit_),            D2D1::RectF(tx + 8, ty + 54, tx + tw - 8, ty + 70), fmtMono_, theme_.seriesTemp);
+        }
+    }
+}
+
+void AppUI::DrawHistoryFlowBars(const D2D1_RECT_F& card) {
+    DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+    DrawTextLine(L"Data & Power Flow Breakdown Across Recorded Period",
+                 D2D1::RectF(card.left + 14, card.top + 8, card.right - 14, card.top + 30),
+                 fmtHeading_, theme_.textPrimary);
+
+    float leftX  = card.left + 14.0f;
+    float midX   = (card.left + card.right) * 0.5f;
+    float rightX = card.right - 14.0f;
+    float topY   = card.top + 36.0f;
+    float availH = std::max(40.0f, card.bottom - topY - 10.0f);
+
+    // Left column: Top Data Flow Entities (Ports & Disks)
+    std::vector<const LogEntitySeries*> dataEnts;
+    double maxDataBytes = 1.0;
+    for (const auto& e : histSession_.entities) {
+        double tot = e.totalToBytes + e.totalFroBytes;
+        if (tot > 0.0) {
+            dataEnts.push_back(&e);
+            maxDataBytes = std::max(maxDataBytes, tot);
+        }
+    }
+    std::sort(dataEnts.begin(), dataEnts.end(), [](const LogEntitySeries* a, const LogEntitySeries* b) {
+        return (a->totalToBytes + a->totalFroBytes) > (b->totalToBytes + b->totalFroBytes);
+    });
+
+    // Right column: Top Power & Thermal Entities
+    std::vector<const LogEntitySeries*> pwrEnts;
+    double maxPwrW = 1.0;
+    for (const auto& e : histSession_.entities) {
+        if (e.hasAnyPower || e.hasAnyTemp) {
+            pwrEnts.push_back(&e);
+            maxPwrW = std::max(maxPwrW, e.peakPowerW);
+        }
+    }
+    std::sort(pwrEnts.begin(), pwrEnts.end(), [](const LogEntitySeries* a, const LogEntitySeries* b) {
+        return a->peakPowerW > b->peakPowerW;
+    });
+
+    constexpr float kBarRowH = 34.0f;
+    int maxRows = std::max(1, static_cast<int>(availH / kBarRowH));
+
+    // Draw Left: Data Flow Bars
+    float col1W = midX - leftX - 16.0f;
+    DrawTextLine(L"TOP DATA FLOW (TO + FRO)", D2D1::RectF(leftX, topY, leftX + col1W, topY + 18), fmtSmall_, theme_.textMuted);
+    float ry = topY + 20.0f;
+    for (int i = 0; i < maxRows && i < static_cast<int>(dataEnts.size()); ++i) {
+        const auto* e = dataEnts[static_cast<size_t>(i)];
+        double tot = e->totalToBytes + e->totalFroBytes;
+        float fracTo  = static_cast<float>(std::clamp(e->totalToBytes  / maxDataBytes, 0.0, 1.0));
+        float fracFro = static_cast<float>(std::clamp(e->totalFroBytes / maxDataBytes, 0.0, 1.0));
+
+        DrawTextLine(e->name, D2D1::RectF(leftX, ry, leftX + col1W * 0.58f, ry + 16), fmtSmall_, theme_.textPrimary);
+        DrawTextLine(FormatBytesSize(tot) + L" (To " + FormatBytesSize(e->totalToBytes) + L" / Fro " + FormatBytesSize(e->totalFroBytes) + L")",
+                     D2D1::RectF(leftX + col1W * 0.48f, ry, leftX + col1W, ry + 16), fmtSmall_, theme_.textSecondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+        D2D1_RECT_F track = D2D1::RectF(leftX, ry + 18, leftX + col1W, ry + 26);
+        DrawRoundedRect(track, 4.0f, theme_.bgChart, theme_.gridLine, 1.0f);
+        float wTo  = col1W * fracTo;
+        float wFro = std::min(col1W - wTo, col1W * fracFro);
+        if (wTo > 1.0f)  DrawRoundedRect(D2D1::RectF(leftX, ry + 18, leftX + wTo, ry + 26), 4.0f, theme_.seriesTo, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+        if (wFro > 1.0f) DrawRoundedRect(D2D1::RectF(leftX + wTo, ry + 18, leftX + wTo + wFro, ry + 26), 4.0f, theme_.seriesFro, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+
+        ry += kBarRowH;
+    }
+
+    // Divider
+    brush_->SetColor(theme_.border);
+    rt_->DrawLine(D2D1::Point2F(midX, topY), D2D1::Point2F(midX, card.bottom - 10.0f), brush_, 1.0f);
+
+    // Draw Right: Power & Thermal Flow Bars
+    float col2L = midX + 16.0f;
+    float col2W = rightX - col2L;
+    DrawTextLine(L"PEAK POWER & TEMPERATURE", D2D1::RectF(col2L, topY, rightX, topY + 18), fmtSmall_, theme_.textMuted);
+    ry = topY + 20.0f;
+    for (int i = 0; i < maxRows && i < static_cast<int>(pwrEnts.size()); ++i) {
+        const auto* e = pwrEnts[static_cast<size_t>(i)];
+        float fracP = e->hasAnyPower ? static_cast<float>(std::clamp(e->peakPowerW / maxPwrW, 0.0, 1.0)) : 0.0f;
+
+        std::wstring rightStat;
+        if (e->hasAnyPower) rightStat += L"Peak " + FormatPowerPlain(e->peakPowerW, true) + L" (Avg " + FormatPowerPlain(e->avgPowerW, true) + L")";
+        if (e->hasAnyTemp) {
+            if (!rightStat.empty()) rightStat += L"  |  ";
+            rightStat += FormatTempC(e->peakTempC, true, useFahrenheit_);
+        }
+
+        DrawTextLine(e->name, D2D1::RectF(col2L, ry, col2L + col2W * 0.48f, ry + 16), fmtSmall_, theme_.textPrimary);
+        DrawTextLine(rightStat, D2D1::RectF(col2L + col2W * 0.45f, ry, rightX, ry + 16), fmtSmall_, theme_.textSecondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+        D2D1_RECT_F track = D2D1::RectF(col2L, ry + 18, rightX, ry + 26);
+        DrawRoundedRect(track, 4.0f, theme_.bgChart, theme_.gridLine, 1.0f);
+        if (fracP > 0.01f) {
+            DrawRoundedRect(D2D1::RectF(col2L, ry + 18, col2L + col2W * fracP, ry + 26), 4.0f, theme_.seriesPowerDel, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+        } else if (e->hasAnyTemp) {
+            float fracT = static_cast<float>(std::clamp(e->peakTempC / 100.0, 0.0, 1.0));
+            DrawRoundedRect(D2D1::RectF(col2L, ry + 18, col2L + col2W * fracT, ry + 26), 4.0f, theme_.seriesTemp, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+        }
+
+        ry += kBarRowH;
+    }
+}
+
 void AppUI::DrawSettingsPage(float width, float height) {
     constexpr float kPad = 24.0f;
     float maxW   = std::min(width - kPad * 2.0f, 860.0f);
@@ -652,8 +1318,8 @@ void AppUI::DrawSettingsPage(float width, float height) {
     float viewTop = 58.0f;
     float viewH   = std::max(100.0f, height - viewTop);
 
-    // 8 rows * (68 + 12) + header(64) + footer(74) + padding(24)
-    float totalContentH = 64.0f + 8.0f * 80.0f + 74.0f + 24.0f;
+    // 11 rows * (68 + 12) + header(64) + footer(74) + padding(24)
+    float totalContentH = 64.0f + 11.0f * 80.0f + 74.0f + 24.0f;
     settingsMaxScrollY_ = std::max(0.0f, totalContentH - viewH);
     settingsScrollY_    = std::clamp(settingsScrollY_, 0.0f, settingsMaxScrollY_);
 
@@ -662,23 +1328,23 @@ void AppUI::DrawSettingsPage(float width, float height) {
     float y = 74.0f - settingsScrollY_;
 
     DrawTextLine(L"Settings", D2D1::RectF(left, y, left + 300, y + 30), fmtTitle_, theme_.textPrimary);
-    DrawTextLine(L"App display, startup & tray preferences — never modifies hardware or device properties",
+    DrawTextLine(L"App display, logging, startup & tray preferences — never modifies hardware or device properties",
                  D2D1::RectF(left, y + 30, left + maxW, y + 50), fmtSmall_, theme_.textSecondary);
     y += 64.0f;
 
-    auto drawSettingRow = [&](const wchar_t* title, const wchar_t* desc,
+    auto drawSettingRow = [&](const wchar_t* title, const std::wstring& desc,
                               const std::vector<std::tuple<const wchar_t*, bool, int>>& opts) {
         float rowH = 68.0f;
         D2D1_RECT_F card = D2D1::RectF(left, y, left + maxW, y + rowH);
         if (card.bottom >= viewTop && card.top <= height) {
             DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
 
-            DrawTextLine(title, D2D1::RectF(card.left + 16, card.top + 10, card.left + maxW * 0.52f, card.top + 34),
+            DrawTextLine(title, D2D1::RectF(card.left + 16, card.top + 10, card.left + maxW * 0.50f, card.top + 34),
                          fmtBold_, theme_.textPrimary);
             DrawTextLine(desc,  D2D1::RectF(card.left + 16, card.top + 34, card.left + maxW * 0.56f, card.top + 56),
                          fmtSmall_, theme_.textSecondary);
 
-            float btnW = (opts.size() == 3) ? 94.0f : (opts.size() == 1 ? 154.0f : 124.0f);
+            float btnW = (opts.size() == 4) ? 72.0f : (opts.size() == 3 ? 94.0f : (opts.size() == 1 ? 154.0f : 124.0f));
             float gap  = 8.0f;
             float totalW = static_cast<float>(opts.size()) * btnW + static_cast<float>(opts.size() - 1) * gap;
             float bx = card.right - 16.0f - totalW;
@@ -697,6 +1363,21 @@ void AppUI::DrawSettingsPage(float width, float height) {
         }
         y += rowH + 12.0f;
     };
+
+    drawSettingRow(L"Continuous Data Capture", L"Crash-safe background logging to .ptlog files (stays active while viewing History)", {
+        { captureLogEnabled_ ? L"Capturing (ON)" : L"Paused (OFF)", captureLogEnabled_, kActToggleCaptureLog }
+    });
+
+    drawSettingRow(L"Capture Timeframe (Max 24 hrs)", L"Duration per continuous session file before rolling over", {
+        { L"1 hr",   captureMaxHours_ == 1,  kActSetLogHrs1 },
+        { L"6 hrs",  captureMaxHours_ == 6,  kActSetLogHrs6 },
+        { L"12 hrs", captureMaxHours_ == 12, kActSetLogHrs12 },
+        { L"24 hrs", captureMaxHours_ == 24, kActSetLogHrs24 }
+    });
+
+    drawSettingRow(L"Telemetry Storage Folder", captureLogDir_, {
+        { L"Choose Folder...", false, kActChooseLogFolder }
+    });
 
     drawSettingRow(L"Start on Windows Startup", L"Launch Port Tool automatically in the background when you sign in", {
         { startWithWindows_ ? L"Enabled" : L"Disabled", startWithWindows_, kActToggleStartWithWin }

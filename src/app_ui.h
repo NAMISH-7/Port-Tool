@@ -16,6 +16,7 @@
 #include "port_types.h"
 #include "ui_theme.h"
 #include "audio_waveform.h"
+#include "telemetry_logger.h"
 
 namespace porttool {
 
@@ -32,6 +33,7 @@ public:
 
     bool Initialize(HWND hwnd);
     void Shutdown();
+    void AttachRecorder(TelemetryRecorder* recorder);
 
     void Resize(UINT width, UINT height);
     void UpdateData(std::vector<PortInfo> ports, std::vector<SysCompInfo> sysComps);
@@ -55,6 +57,7 @@ private:
     enum MainTab {
         kTabPorts = 0,
         kTabSystem,
+        kTabHistory,
         kTabSettings
     };
 
@@ -65,6 +68,7 @@ private:
         kActCloseMenu,
         kActSwitchTabPorts,
         kActSwitchTabSystem,
+        kActSwitchTabHistory,
         kActSwitchTabSettings,
         kActFilterAll,
         kActFilterUSB,
@@ -90,7 +94,18 @@ private:
         kActToggleShowUnused,
         kActToggleAudioWave,
         kActToggleStartWithWin,
-        kActToggleMinimizeToTray
+        kActToggleMinimizeToTray,
+        kActToggleCaptureLog,
+        kActSetLogHrs1,
+        kActSetLogHrs6,
+        kActSetLogHrs12,
+        kActSetLogHrs24,
+        kActChooseLogFolder,
+        // History & Logs actions
+        kActHistRefresh,
+        kActHistBrowseFile,
+        kActHistLoadFile,
+        kActHistSelectEntity
     };
 
     bool CreateDeviceResources();
@@ -99,7 +114,13 @@ private:
 
     void DrawTopBar(float width);
     void DrawBurgerMenuOverlay(float width, float height);
+    void DrawHistoryPage(float width, float height);
+    void DrawHistoryTimelineChart(const D2D1_RECT_F& card, const std::vector<LogSeriesPoint>& pts, bool isDataMode);
+    void DrawHistoryFlowBars(const D2D1_RECT_F& card);
     void DrawSettingsPage(float width, float height);
+    void RefreshHistoryFileList();
+    void LoadHistoryFile(const std::wstring& path);
+    void SyncRecorderConfig();
 
     // Ports Tab
     void DrawMainPage(float width, float height);
@@ -165,8 +186,20 @@ private:
     bool         enableAudioWave_    = true;
     bool         startWithWindows_   = false;
     bool         minimizeToTray_     = true;
+    bool         captureLogEnabled_  = true;
+    uint32_t     captureMaxHours_    = 24;
+    std::wstring captureLogDir_;
     float        settingsScrollY_    = 0.0f;
     float        settingsMaxScrollY_ = 0.0f;
+
+    // History & Logs tab state (independent from live recording!)
+    TelemetryRecorder*        recorder_ = nullptr;
+    std::vector<LogFileEntry> histFiles_;
+    LoadedLogSession          histSession_{};
+    bool                      histLoaded_ = false;
+    int                       histSelectedEntity_ = -1; // -1 = Overview, >= 0 = index into histSession_.entities
+    float                     histFileScrollY_    = 0.0f;
+    float                     histFileMaxScrollY_ = 0.0f;
 
     // Hover state
     float mouseX_ = -1.0f;
