@@ -15,6 +15,7 @@
 
 #include "port_types.h"
 #include "ui_theme.h"
+#include "audio_waveform.h"
 
 namespace porttool {
 
@@ -45,6 +46,7 @@ public:
 
     bool IsDarkMode() const { return isDark_; }
     void SetDarkMode(bool dark);
+    bool NeedsFastRedraw() const;
 
 private:
     enum MainTab {
@@ -81,6 +83,8 @@ private:
     void DrawDetailPage(float width, float height);
     void DrawDataGraph(const D2D1_RECT_F& cardRect, const PortInfo& port);
     void DrawPowerGraph(const D2D1_RECT_F& cardRect, const PortInfo& port);
+    void DrawAudioWaveformGraph(const D2D1_RECT_F& cardRect, const PortInfo& port);
+    void SyncAudioWaveformTarget();
 
     // System Hardware Tab (CPU, GPU(s), Disk(s), Memory)
     void DrawSystemMainPage(float width, float height);
@@ -140,6 +144,7 @@ private:
     // Latest snapshots
     std::vector<PortInfo>    ports_;
     std::vector<SysCompInfo> sysComps_;
+    AudioWaveformTap         audioTap_;
 };
 
 } // namespace porttool

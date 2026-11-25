@@ -97,6 +97,7 @@ bool AppUI::Initialize(HWND hwnd) {
 }
 
 void AppUI::Shutdown() {
+    audioTap_.Stop();
     DiscardDeviceResources();
     SafeRelease(fmtTitle_);
     SafeRelease(fmtHeading_);
@@ -160,7 +161,28 @@ void AppUI::Resize(UINT width, UINT height) {
 void AppUI::UpdateData(std::vector<PortInfo> ports, std::vector<SysCompInfo> sysComps) {
     ports_    = std::move(ports);
     sysComps_ = std::move(sysComps);
+    SyncAudioWaveformTarget();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+bool AppUI::NeedsFastRedraw() const {
+    return activeTab_ == kTabPorts && inDetailView_ && audioTap_.IsCapturing();
+}
+
+void AppUI::SyncAudioWaveformTarget() {
+    if (activeTab_ == kTabPorts && inDetailView_) {
+        const PortInfo* p = FindSelectedPort();
+        if (p && p->category == PortCategory::Audio && p->active) {
+            // Port ID format: "audio:<MMDeviceEndpointId>"
+            if (p->id.rfind(L"audio:", 0) == 0 && p->id.size() > 6) {
+                std::wstring endpointId = p->id.substr(6);
+                bool isOutput = (p->name.rfind(L"Audio Out:", 0) == 0);
+                audioTap_.SetTarget(endpointId, isOutput);
+                return;
+            }
+        }
+    }
+    audioTap_.Stop();
 }
 
 void AppUI::OnMouseMove(float dipX, float dipY) {
@@ -253,6 +275,7 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
                 default:
                     break;
             }
+            SyncAudioWaveformTarget();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return;
         }
@@ -276,6 +299,7 @@ void AppUI::OnKeyDown(WPARAM vk) {
         if (activeTab_ == kTabPorts && inDetailView_) {
             inDetailView_ = false;
             selectedPortId_.clear();
+            SyncAudioWaveformTarget();
             InvalidateRect(hwnd_, nullptr, FALSE);
         } else if (activeTab_ == kTabSystem && inSysDetailView_) {
             inSysDetailView_ = false;
@@ -663,8 +687,100 @@ void AppUI::DrawDetailPage(float width, float height) {
     float gap    = 16.0f;
     float graphH = (availH - gap) * 0.5f;
 
-    DrawDataGraph(D2D1::RectF(kPad, y, width - kPad, y + graphH), *port);
-    DrawPowerGraph(D2D1::RectF(kPad, y + graphH + gap, width - kPad, y + graphH * 2.0f + gap), *port);
+    if (port->category == PortCategory::Audio) {
+        DrawAudioWaveformGraph(D2D1::RectF(kPad, y, width - kPad, y + graphH), *port);
+        DrawDataGraph(D2D1::RectF(kPad, y + graphH + gap, width - kPad, y + graphH * 2.0f + gap), *port);
+    } else {
+        DrawDataGraph(D2D1::RectF(kPad, y, width - kPad, y + graphH), *port);
+        DrawPowerGraph(D2D1::RectF(kPad, y + graphH + gap, width - kPad, y + graphH * 2.0f + gap), *port);
+    }
+}
+
+void AppUI::DrawAudioWaveformGraph(const D2D1_RECT_F& card, const PortInfo& port) {
+    DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+
+    bool isOutput = (port.name.rfind(L"Audio Out:", 0) == 0);
+    DrawTextLine(isOutput ? L"Live Audio Output Waveform (Loopback Oscilloscope)"
+                          : L"Live Audio Input Waveform (Microphone Oscilloscope)",
+                 D2D1::RectF(card.left + 16, card.top + 10, card.left + 480, card.top + 34),
+                 fmtHeading_, theme_.textPrimary);
+
+    WaveformSnapshot snap = audioTap_.GetSnapshot();
+
+    // Live Peak dBFS & Level readout on top right
+    if (port.active && snap.active) {
+        double db = (snap.peakLinear > 1e-5f) ? (20.0 * std::log10(static_cast<double>(snap.peakLinear))) : -96.0;
+        wchar_t dbBuf[64];
+        if (db <= -90.0) swprintf_s(dbBuf, L"Peak: Silent (-inf dB)");
+        else             swprintf_s(dbBuf, L"Peak: %.1f dBFS  |  RMS: %.0f%%", db, snap.rmsLinear * 100.0f);
+        DrawTextLine(dbBuf, D2D1::RectF(card.right - 280, card.top + 11, card.right - 16, card.top + 34),
+                     fmtMono_, isOutput ? theme_.seriesTo : theme_.seriesFro, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    D2D1_RECT_F plot = D2D1::RectF(card.left + 58.0f, card.top + 42.0f, card.right - 20.0f, card.bottom - 24.0f);
+    DrawRoundedRect(plot, 6.0f, theme_.bgChart, theme_.gridLine, 1.0f);
+
+    if (!port.active) {
+        DrawTextLine(L"N/A — Audio Port Unplugged", plot, fmtHeading_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    if (!snap.active || snap.samples.size() < 2) {
+        DrawTextLine(L"Starting read-only WASAPI audio stream...", plot, fmtBody_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
+    float plotW = plot.right - plot.left;
+    float plotH = plot.bottom - plot.top;
+    float midY  = (plot.top + plot.bottom) * 0.5f;
+
+    // Horizontal gridlines (+1.0, +0.5, 0.0, -0.5, -1.0)
+    const wchar_t* yLbls[] = { L"+1.0", L"+0.5", L"0.0", L"-0.5", L"-1.0" };
+    for (int i = 0; i < 5; ++i) {
+        float frac = static_cast<float>(i) / 4.0f;
+        float gy = plot.top + frac * plotH;
+        if (i == 2) {
+            brush_->SetColor(theme_.borderStrong);
+            rt_->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), brush_, 1.0f);
+        } else if (i == 1 || i == 3) {
+            brush_->SetColor(theme_.gridLine);
+            rt_->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), brush_, 1.0f);
+        }
+        DrawTextLine(yLbls[i], D2D1::RectF(card.left + 6.0f, gy - 8.0f, plot.left - 8.0f, gy + 8.0f),
+                     fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+
+    // Waveform PathGeometry
+    ID2D1PathGeometry* waveGeo = nullptr;
+    if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&waveGeo)) && waveGeo) {
+        ID2D1GeometrySink* sink = nullptr;
+        if (SUCCEEDED(waveGeo->Open(&sink)) && sink) {
+            size_t n = snap.samples.size();
+            float halfH = (plotH * 0.5f) - 4.0f;
+            for (size_t i = 0; i < n; ++i) {
+                float px = plot.left + (static_cast<float>(i) / static_cast<float>(n - 1)) * plotW;
+                float py = midY - std::clamp(snap.samples[i], -1.0f, 1.0f) * halfH;
+                if (i == 0) sink->BeginFigure(D2D1::Point2F(px, py), D2D1_FIGURE_BEGIN_HOLLOW);
+                else        sink->AddLine(D2D1::Point2F(px, py));
+            }
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            sink->Close();
+            SafeRelease(sink);
+
+            brush_->SetColor(isOutput ? theme_.seriesTo : theme_.seriesFro);
+            rt_->DrawGeometry(waveGeo, brush_, 1.8f);
+        }
+        SafeRelease(waveGeo);
+    }
+
+    // Subtle peak meter bar along the bottom of the card
+    float barW = (plot.right - plot.left) * std::clamp(snap.peakLinear, 0.0f, 1.0f);
+    if (barW > 1.0f) {
+        D2D1_RECT_F meterBg = D2D1::RectF(plot.left, plot.bottom + 6.0f, plot.right, plot.bottom + 12.0f);
+        DrawRoundedRect(meterBg, 3.0f, theme_.gridLine, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+        D2D1_RECT_F meterFg = D2D1::RectF(plot.left, plot.bottom + 6.0f, plot.left + barW, plot.bottom + 12.0f);
+        DrawRoundedRect(meterFg, 3.0f, isOutput ? theme_.seriesTo : theme_.seriesFro, D2D1::ColorF(0, 0, 0, 0), 0.0f);
+    }
 }
 
 void AppUI::DrawDataGraph(const D2D1_RECT_F& card, const PortInfo& port) {

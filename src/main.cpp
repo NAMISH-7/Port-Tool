@@ -67,6 +67,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        case WM_TIMER:
+            if (ctx && wParam == 1 && ctx->ui.NeedsFastRedraw()) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+
         case WM_MOUSEMOVE:
             if (ctx) {
                 if (!ctx->trackingMouse) {
@@ -162,6 +168,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    SetTimer(hwnd, 1, 33, nullptr); // 30 FPS refresh ONLY when viewing live audio waveform
 
     // Background 2 Hz (0.5 sec) read-only polling thread
     ctx.pollThread = std::thread([&ctx, hwnd]() {
