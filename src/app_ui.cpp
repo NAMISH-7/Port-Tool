@@ -725,6 +725,12 @@ void AppUI::DrawAudioWaveformGraph(const D2D1_RECT_F& card, const PortInfo& port
         return;
     }
 
+    if (snap.micIdleNoExternalApp) {
+        DrawTextLine(L"N/A — Microphone Not In Use by Any App (Kept Off in Passive Read-Only Mode)",
+                     plot, fmtHeading_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+
     if (!snap.active || snap.samples.size() < 2) {
         DrawTextLine(L"Starting read-only WASAPI audio stream...", plot, fmtBody_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
         return;
