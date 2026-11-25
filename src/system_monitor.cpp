@@ -85,6 +85,170 @@ std::wstring FormatCacheSize(uint64_t bytes) {
     return buf;
 }
 
+// Minimal WDDM D3DKMT definitions (read-only QueryAdapterInfo from gdi32.dll, same as Task Manager)
+using NTSTATUS_KMT = LONG;
+constexpr UINT kKmtQaiAdapterPerfData = 62;
+
+struct KmtOpenAdapterFromLuid {
+    LUID AdapterLuid;
+    UINT hAdapter;
+};
+
+struct KmtCloseAdapter {
+    UINT hAdapter;
+};
+
+struct KmtQueryAdapterInfo {
+    UINT  hAdapter;
+    UINT  Type;
+    void* pPrivateDriverData;
+    UINT  PrivateDriverDataSize;
+};
+
+struct KmtAdapterPerfData {
+    UINT32 PhysicalAdapterIndex;
+    UINT64 MemoryFrequency;      // Hz
+    UINT64 MaxMemoryFrequency;   // Hz
+    UINT64 MaxMemoryFrequencyOC; // Hz
+    UINT64 MemoryBandwidth;      // Bytes/s
+    UINT64 PCIEBandwidth;        // Bytes/s
+    UINT32 FanRPM;
+    UINT32 Power;                // Tenths of a percent of TDP (1000 = 100%)
+    UINT32 Temperature;          // Tenths of a degree Celsius (450 = 45.0 C)
+    UCHAR  PowerStateOverride;
+};
+
+using FnD3DKMTOpenAdapterFromLuid = NTSTATUS_KMT(WINAPI*)(KmtOpenAdapterFromLuid*);
+using FnD3DKMTQueryAdapterInfo    = NTSTATUS_KMT(WINAPI*)(const KmtQueryAdapterInfo*);
+using FnD3DKMTCloseAdapter        = NTSTATUS_KMT(WINAPI*)(const KmtCloseAdapter*);
+
+struct GpuPerfTelemetry {
+    bool     hasTemp      = false;
+    double   tempC        = 0.0;
+    bool     hasPowerW    = false;
+    double   powerWatts   = 0.0;
+    bool     hasPowerPct  = false;
+    double   powerPct     = 0.0;
+    uint32_t fanRpm       = 0;
+    uint64_t memFreqHz    = 0;
+    std::wstring tempSource;
+    std::wstring powerSource;
+};
+
+GpuPerfTelemetry QueryGpuPerfTelemetry(LUID luid, UINT vendorId, UINT deviceId) {
+    GpuPerfTelemetry out{};
+
+    // 1. WDDM D3DKMTQueryAdapterInfo (built-in gdi32.dll — works on AMD, NVIDIA, Intel WDDM 2.4+)
+    static HMODULE hGdi = GetModuleHandleW(L"gdi32.dll");
+    static auto fnOpen  = hGdi ? reinterpret_cast<FnD3DKMTOpenAdapterFromLuid>(GetProcAddress(hGdi, "D3DKMTOpenAdapterFromLuid")) : nullptr;
+    static auto fnQuery = hGdi ? reinterpret_cast<FnD3DKMTQueryAdapterInfo>(GetProcAddress(hGdi, "D3DKMTQueryAdapterInfo"))       : nullptr;
+    static auto fnClose = hGdi ? reinterpret_cast<FnD3DKMTCloseAdapter>(GetProcAddress(hGdi, "D3DKMTCloseAdapter"))               : nullptr;
+
+    if (fnOpen && fnQuery && fnClose) {
+        KmtOpenAdapterFromLuid openArg{};
+        openArg.AdapterLuid = luid;
+        if (fnOpen(&openArg) == 0 && openArg.hAdapter != 0) {
+            KmtAdapterPerfData perf{};
+            perf.PhysicalAdapterIndex = 0;
+            KmtQueryAdapterInfo q{};
+            q.hAdapter              = openArg.hAdapter;
+            q.Type                  = kKmtQaiAdapterPerfData;
+            q.pPrivateDriverData    = &perf;
+            q.PrivateDriverDataSize = sizeof(perf);
+
+            if (fnQuery(&q) == 0) {
+                if (perf.Temperature > 0 && perf.Temperature < 1500) {
+                    out.hasTemp    = true;
+                    out.tempC      = static_cast<double>(perf.Temperature) / 10.0;
+                    out.tempSource = L"WDDM D3DKMT GPU Thermal Sensor";
+                }
+                if (perf.Power > 0 && perf.Power <= 2000) {
+                    out.hasPowerPct = true;
+                    out.powerPct    = static_cast<double>(perf.Power) / 10.0;
+                }
+                out.fanRpm    = perf.FanRPM;
+                out.memFreqHz = perf.MemoryFrequency;
+            }
+
+            KmtCloseAdapter closeArg{ openArg.hAdapter };
+            fnClose(&closeArg);
+        }
+    }
+
+    // 2. Optional read-only NVML query for NVIDIA GPUs (only if driver's nvml.dll is already on system)
+    if (vendorId == 0x10DE) {
+        static bool nvmlInitAttempted = false;
+        static bool nvmlReady = false;
+        using FnNvmlInit     = int(*)(void);
+        using FnNvmlGetCount = int(*)(unsigned int*);
+        using FnNvmlGetByIdx = int(*)(unsigned int, void**);
+        using FnNvmlGetPci   = int(*)(void*, void*);
+        using FnNvmlGetTemp  = int(*)(void*, int, unsigned int*);
+        using FnNvmlGetPower = int(*)(void*, unsigned int*);
+
+        static FnNvmlGetCount fnCount = nullptr;
+        static FnNvmlGetByIdx fnByIdx = nullptr;
+        static FnNvmlGetPci   fnPci   = nullptr;
+        static FnNvmlGetTemp  fnTemp  = nullptr;
+        static FnNvmlGetPower fnPower = nullptr;
+
+        if (!nvmlInitAttempted) {
+            nvmlInitAttempted = true;
+            HMODULE hNvml = LoadLibraryW(L"nvml.dll");
+            if (hNvml) {
+                auto fnInit = reinterpret_cast<FnNvmlInit>(GetProcAddress(hNvml, "nvmlInit_v2"));
+                fnCount = reinterpret_cast<FnNvmlGetCount>(GetProcAddress(hNvml, "nvmlDeviceGetCount_v2"));
+                fnByIdx = reinterpret_cast<FnNvmlGetByIdx>(GetProcAddress(hNvml, "nvmlDeviceGetHandleByIndex_v2"));
+                fnPci   = reinterpret_cast<FnNvmlGetPci>(GetProcAddress(hNvml, "nvmlDeviceGetPciInfo_v3"));
+                fnTemp  = reinterpret_cast<FnNvmlGetTemp>(GetProcAddress(hNvml, "nvmlDeviceGetTemperature"));
+                fnPower = reinterpret_cast<FnNvmlGetPower>(GetProcAddress(hNvml, "nvmlDeviceGetPowerUsage"));
+                if (fnInit && fnCount && fnByIdx && fnTemp && fnPower && fnInit() == 0) {
+                    nvmlReady = true;
+                }
+            }
+        }
+
+        if (nvmlReady) {
+            unsigned int count = 0;
+            if (fnCount(&count) == 0 && count > 0) {
+                for (unsigned int i = 0; i < count; ++i) {
+                    void* dev = nullptr;
+                    if (fnByIdx(i, &dev) != 0 || !dev) continue;
+
+                    // Match PCI deviceId if multiple NVIDIA GPUs exist
+                    if (count > 1 && fnPci) {
+                        struct NvmlPciInfo {
+                            char busIdLegacy[16];
+                            unsigned int domain, bus, device, pciDeviceId, pciSubSystemId;
+                            char busId[32];
+                        } pci{};
+                        if (fnPci(dev, &pci) == 0) {
+                            UINT nvDevId = (pci.pciDeviceId >> 16) & 0xFFFF;
+                            if (nvDevId != 0 && nvDevId != deviceId) continue;
+                        }
+                    }
+
+                    unsigned int tC = 0;
+                    if (fnTemp(dev, 0 /* NVML_TEMPERATURE_GPU */, &tC) == 0 && tC > 0 && tC < 130) {
+                        out.hasTemp    = true;
+                        out.tempC      = static_cast<double>(tC);
+                        out.tempSource = L"NVIDIA GPU Thermal Sensor (NVML)";
+                    }
+                    unsigned int mw = 0;
+                    if (fnPower(dev, &mw) == 0 && mw > 0) {
+                        out.hasPowerW   = true;
+                        out.powerWatts  = static_cast<double>(mw) / 1000.0;
+                        out.powerSource = L"NVIDIA GPU Power Sensor (NVML)";
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    return out;
+}
+
 } // namespace
 
 SystemMonitor::SystemMonitor() {
@@ -534,15 +698,19 @@ void SystemMonitor::PollGpus(std::vector<SysCompInfo>& out, uint64_t nowMs) {
         c.current.dataToVal  = static_cast<double>(shrUsed);
         c.dataIsBytesNotRate = true;
 
-        c.current.hasPower = false;
-        c.current.hasTemp  = false;
-        c.powerNote = L"Not exposed by standard Windows DXGI/PDH APIs";
-        c.tempNote  = L"Not exposed by standard Windows DXGI/PDH APIs";
+        GpuPerfTelemetry perf = QueryGpuPerfTelemetry(desc.AdapterLuid, desc.VendorId, desc.DeviceId);
+
+        c.current.hasPower   = perf.hasPowerW;
+        c.current.powerWatts = perf.powerWatts;
+        c.current.hasTemp    = perf.hasTemp;
+        c.current.tempC      = perf.tempC;
+        c.powerNote = perf.hasPowerW ? perf.powerSource : L"Power wattage not exposed by GPU driver";
+        c.tempNote  = perf.hasTemp   ? perf.tempSource  : L"GPU thermal sensor sleeping or not exposed";
 
         c.utilSummary  = FormatPercent(utilPct, true);
         c.dataSummary  = FormatBytesSize(static_cast<double>(dedUsed)) + L" / " + FormatBytesSize(static_cast<double>(dedBudget));
-        c.powerSummary = L"N/A";
-        c.tempSummary  = L"N/A";
+        c.powerSummary = FormatPowerPlain(perf.powerWatts, perf.hasPowerW);
+        c.tempSummary  = FormatTempC(perf.tempC, perf.hasTemp);
 
         c.utilTitle       = L"GPU Utilization & VRAM vs Time (%)";
         c.utilSeries1Name = L"GPU Engine %";
@@ -554,6 +722,10 @@ void SystemMonitor::PollGpus(std::vector<SysCompInfo>& out, uint64_t nowMs) {
         wchar_t pciBuf[64];
         swprintf_s(pciBuf, L"VEN_%04X & DEV_%04X", desc.VendorId, desc.DeviceId);
 
+        wchar_t memClkBuf[48];
+        if (perf.memFreqHz > 0) swprintf_s(memClkBuf, L"%.0f MHz", static_cast<double>(perf.memFreqHz) / 1e6);
+        else                    swprintf_s(memClkBuf, L"N/A");
+
         c.details = {
             { L"GPU Utilization",       FormatPercent(utilPct, true) },
             { L"3D Engine",             FormatPercent(d3dPct, true) },
@@ -561,6 +733,10 @@ void SystemMonitor::PollGpus(std::vector<SysCompInfo>& out, uint64_t nowMs) {
             { L"Video Decode/Encode",   FormatPercent(vidPct, true) },
             { L"Dedicated GPU Memory",  FormatBytesSize(static_cast<double>(dedUsed)) + L" / " + FormatBytesSize(static_cast<double>(dedBudget)) },
             { L"Shared GPU Memory",     FormatBytesSize(static_cast<double>(shrUsed)) + L" / " + FormatBytesSize(static_cast<double>(shrBudget)) },
+            { L"GPU Temperature",       c.tempSummary },
+            { L"GPU Power",             perf.hasPowerW ? c.powerSummary : (perf.hasPowerPct ? FormatPercent(perf.powerPct, true) + L" TDP" : L"N/A") },
+            { L"Memory Clock",          memClkBuf },
+            { L"Fan Speed",             perf.fanRpm > 0 ? (std::to_wstring(perf.fanRpm) + L" RPM") : L"N/A" },
             { L"Hardware ID",           pciBuf }
         };
 
