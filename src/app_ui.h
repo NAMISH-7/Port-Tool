@@ -44,21 +44,26 @@ public:
     void OnMouseWheel(int delta);
     void OnKeyDown(WPARAM vk);
 
-    bool IsDarkMode() const { return isDark_; }
-    void SetDarkMode(bool dark);
-    bool NeedsFastRedraw() const;
+    bool     IsDarkMode() const { return isDark_; }
+    void     SetDarkMode(bool dark);
+    bool     NeedsFastRedraw() const;
+    uint32_t GetSampleIntervalMs() const { return sampleIntervalMs_; }
 
 private:
     enum MainTab {
         kTabPorts = 0,
-        kTabSystem
+        kTabSystem,
+        kTabSettings
     };
 
     enum ActionId {
         kActNone = 0,
         kActToggleTheme,
+        kActToggleMenu,
+        kActCloseMenu,
         kActSwitchTabPorts,
         kActSwitchTabSystem,
+        kActSwitchTabSettings,
         kActFilterAll,
         kActFilterUSB,
         kActFilterNet,
@@ -69,7 +74,19 @@ private:
         kActBackToMain,
         kActOpenPort,
         kActBackToSysMain,
-        kActOpenSysComp
+        kActOpenSysComp,
+        // Settings actions
+        kActSetThemeDark,
+        kActSetThemeLight,
+        kActSetRate500,
+        kActSetRate1000,
+        kActSetRate2000,
+        kActSetTempC,
+        kActSetTempF,
+        kActSetDataBytes,
+        kActSetDataBits,
+        kActToggleShowUnused,
+        kActToggleAudioWave
     };
 
     bool CreateDeviceResources();
@@ -77,6 +94,8 @@ private:
     void ApplyWindowTheme();
 
     void DrawTopBar(float width);
+    void DrawBurgerMenuOverlay(float width, float height);
+    void DrawSettingsPage(float width, float height);
 
     // Ports Tab
     void DrawMainPage(float width, float height);
@@ -122,6 +141,7 @@ private:
 
     // Navigation & View state
     MainTab      activeTab_      = kTabPorts;
+    bool         menuOpen_       = false;
     bool         inDetailView_   = false;
     std::wstring selectedPortId_;
     int          categoryFilter_ = -1;
@@ -132,6 +152,13 @@ private:
     std::wstring selectedSysId_;
     float        sysScrollY_      = 0.0f;
     float        sysMaxScrollY_   = 0.0f;
+
+    // App-only Settings (never modifies Windows or hardware)
+    uint32_t     sampleIntervalMs_   = kSampleIntervalMs;
+    bool         useFahrenheit_      = false;
+    bool         useBitsPerSec_      = false;
+    bool         showUnusedPorts_    = true;
+    bool         enableAudioWave_    = true;
 
     // Hover state
     float mouseX_ = -1.0f;

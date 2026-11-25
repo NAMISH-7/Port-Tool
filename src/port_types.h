@@ -146,10 +146,23 @@ inline const wchar_t* SysCompTypeToString(SysCompType t) {
     return L"Hardware";
 }
 
-inline std::wstring FormatBytesPerSec(double bps, bool available) {
+inline std::wstring FormatBytesPerSec(double bps, bool available, bool useBits = false) {
     if (!available) return L"N/A";
     wchar_t buf[64];
     if (bps < 0.0) bps = 0.0;
+    if (useBits) {
+        double bits = bps * 8.0;
+        if (bits < 1000.0) {
+            swprintf_s(buf, L"%.0f bps", bits);
+        } else if (bits < 1000.0 * 1000.0) {
+            swprintf_s(buf, L"%.1f Kbps", bits / 1000.0);
+        } else if (bits < 1000.0 * 1000.0 * 1000.0) {
+            swprintf_s(buf, L"%.2f Mbps", bits / (1000.0 * 1000.0));
+        } else {
+            swprintf_s(buf, L"%.2f Gbps", bits / (1000.0 * 1000.0 * 1000.0));
+        }
+        return buf;
+    }
     if (bps < 1024.0) {
         swprintf_s(buf, L"%.0f B/s", bps);
     } else if (bps < 1024.0 * 1024.0) {
@@ -208,10 +221,15 @@ inline std::wstring FormatPowerShort(double watts, PowerDirection dir, bool avai
     return FormatPowerPlain(watts, true);
 }
 
-inline std::wstring FormatTempC(double tempC, bool available) {
+inline std::wstring FormatTempC(double tempC, bool available, bool useFahrenheit = false) {
     if (!available) return L"N/A";
     wchar_t buf[32];
-    swprintf_s(buf, L"%.1f \u00B0C", tempC);
+    if (useFahrenheit) {
+        double f = (tempC * 9.0 / 5.0) + 32.0;
+        swprintf_s(buf, L"%.1f \u00B0F", f);
+    } else {
+        swprintf_s(buf, L"%.1f \u00B0C", tempC);
+    }
     return buf;
 }
 

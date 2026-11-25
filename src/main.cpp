@@ -170,7 +170,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     UpdateWindow(hwnd);
     SetTimer(hwnd, 1, 33, nullptr); // 30 FPS refresh ONLY when viewing live audio waveform
 
-    // Background 2 Hz (0.5 sec) read-only polling thread
+    // Background live read-only polling thread (respects Settings sample rate)
     ctx.pollThread = std::thread([&ctx, hwnd]() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         while (ctx.running.load(std::memory_order_relaxed)) {
@@ -179,8 +179,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
             ctx.sysMonitor.PollOnce();
             PostMessageW(hwnd, WM_PORTS_UPDATED, 0, 0);
 
-            uint64_t elapsed = GetTickCount64() - t0;
-            uint64_t remain  = (elapsed < porttool::kSampleIntervalMs) ? (porttool::kSampleIntervalMs - elapsed) : 0;
+            uint64_t targetMs = ctx.ui.GetSampleIntervalMs();
+            uint64_t elapsed  = GetTickCount64() - t0;
+            uint64_t remain   = (elapsed < targetMs) ? (targetMs - elapsed) : 0;
             while (remain > 0 && ctx.running.load(std::memory_order_relaxed)) {
                 DWORD step = static_cast<DWORD>(remain > 50 ? 50 : remain);
                 Sleep(step);

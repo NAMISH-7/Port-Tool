@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <tuple>
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -170,7 +171,7 @@ bool AppUI::NeedsFastRedraw() const {
 }
 
 void AppUI::SyncAudioWaveformTarget() {
-    if (activeTab_ == kTabPorts && inDetailView_) {
+    if (enableAudioWave_ && activeTab_ == kTabPorts && inDetailView_) {
         const PortInfo* p = FindSelectedPort();
         if (p && p->category == PortCategory::Audio && p->active) {
             // Port ID format: "audio:<MMDeviceEndpointId>"
@@ -215,11 +216,57 @@ void AppUI::OnLButtonDown(float dipX, float dipY) {
                 case kActToggleTheme:
                     SetDarkMode(!isDark_);
                     break;
+                case kActToggleMenu:
+                    menuOpen_ = !menuOpen_;
+                    break;
+                case kActCloseMenu:
+                    menuOpen_ = false;
+                    break;
                 case kActSwitchTabPorts:
                     activeTab_ = kTabPorts;
+                    menuOpen_  = false;
                     break;
                 case kActSwitchTabSystem:
                     activeTab_ = kTabSystem;
+                    menuOpen_  = false;
+                    break;
+                case kActSwitchTabSettings:
+                    activeTab_ = kTabSettings;
+                    menuOpen_  = false;
+                    break;
+                case kActSetThemeDark:
+                    SetDarkMode(true);
+                    break;
+                case kActSetThemeLight:
+                    SetDarkMode(false);
+                    break;
+                case kActSetRate500:
+                    sampleIntervalMs_ = 500;
+                    break;
+                case kActSetRate1000:
+                    sampleIntervalMs_ = 1000;
+                    break;
+                case kActSetRate2000:
+                    sampleIntervalMs_ = 2000;
+                    break;
+                case kActSetTempC:
+                    useFahrenheit_ = false;
+                    break;
+                case kActSetTempF:
+                    useFahrenheit_ = true;
+                    break;
+                case kActSetDataBytes:
+                    useBitsPerSec_ = false;
+                    break;
+                case kActSetDataBits:
+                    useBitsPerSec_ = true;
+                    break;
+                case kActToggleShowUnused:
+                    showUnusedPorts_ = !showUnusedPorts_;
+                    scrollY_ = 0.0f;
+                    break;
+                case kActToggleAudioWave:
+                    enableAudioWave_ = !enableAudioWave_;
                     break;
                 case kActFilterAll:
                     categoryFilter_ = -1;
@@ -295,6 +342,11 @@ void AppUI::OnMouseWheel(int delta) {
 }
 
 void AppUI::OnKeyDown(WPARAM vk) {
+    if (vk == VK_ESCAPE && menuOpen_) {
+        menuOpen_ = false;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
     if (vk == VK_ESCAPE || vk == VK_BACK) {
         if (activeTab_ == kTabPorts && inDetailView_) {
             inDetailView_ = false;
@@ -313,6 +365,7 @@ std::vector<const PortInfo*> AppUI::GetFilteredPorts() const {
     std::vector<const PortInfo*> list;
     list.reserve(ports_.size());
     for (const auto& p : ports_) {
+        if (!showUnusedPorts_ && !p.active) continue;
         if (categoryFilter_ >= 0 && static_cast<int>(p.category) != categoryFilter_) continue;
         list.push_back(&p);
     }
@@ -370,9 +423,15 @@ void AppUI::Render() {
     if (activeTab_ == kTabPorts) {
         if (inDetailView_) DrawDetailPage(w, h);
         else               DrawMainPage(w, h);
-    } else {
+    } else if (activeTab_ == kTabSystem) {
         if (inSysDetailView_) DrawSystemDetailPage(w, h);
         else                  DrawSystemMainPage(w, h);
+    } else {
+        DrawSettingsPage(w, h);
+    }
+
+    if (menuOpen_) {
+        DrawBurgerMenuOverlay(w, h);
     }
 
     HRESULT hr = rt_->EndDraw();
@@ -390,16 +449,30 @@ void AppUI::DrawTopBar(float width) {
     brush_->SetColor(theme_.border);
     rt_->DrawLine(D2D1::Point2F(0, kTopH), D2D1::Point2F(width, kTopH), brush_, 1.0f);
 
+    // Burger Menu Button (leftmost)
+    D2D1_RECT_F burgerBtn = D2D1::RectF(14.0f, 11.0f, 50.0f, 45.0f);
+    bool hoverBurger = !menuOpen_ && mouseInside_ && PtInRectF(burgerBtn, mouseX_, mouseY_);
+    DrawRoundedRect(burgerBtn, 8.0f,
+                    (menuOpen_ || hoverBurger) ? theme_.bgSurfaceHover : theme_.bgPillIdle,
+                    theme_.border, 1.0f);
+    brush_->SetColor(theme_.textPrimary);
+    rt_->DrawLine(D2D1::Point2F(23.0f, 21.0f), D2D1::Point2F(41.0f, 21.0f), brush_, 2.0f);
+    rt_->DrawLine(D2D1::Point2F(23.0f, 28.0f), D2D1::Point2F(41.0f, 28.0f), brush_, 2.0f);
+    rt_->DrawLine(D2D1::Point2F(23.0f, 35.0f), D2D1::Point2F(41.0f, 35.0f), brush_, 2.0f);
+    hitButtons_.push_back({burgerBtn, kActToggleMenu, L""});
+
     // App Title
-    DrawTextLine(L"Port Tool", D2D1::RectF(20, 8, 140, 34), fmtTitle_, theme_.textPrimary);
-    DrawTextLine(L"0.5s Live Read-Only Monitor", D2D1::RectF(20, 32, 210, 50), fmtSmall_, theme_.textSecondary);
+    DrawTextLine(L"Port Tool", D2D1::RectF(62, 8, 175, 34), fmtTitle_, theme_.textPrimary);
+    wchar_t rateBuf[48];
+    swprintf_s(rateBuf, L"%.1fs Live Read-Only", static_cast<double>(sampleIntervalMs_) / 1000.0);
+    DrawTextLine(rateBuf, D2D1::RectF(62, 32, 225, 50), fmtSmall_, theme_.textSecondary);
 
     // Primary Tab Switcher: [ Ports ]  [ System Hardware ]
-    D2D1_RECT_F tabPorts = D2D1::RectF(220, 11, 318, 45);
-    D2D1_RECT_F tabSys   = D2D1::RectF(326, 11, 476, 45);
+    D2D1_RECT_F tabPorts = D2D1::RectF(232, 11, 326, 45);
+    D2D1_RECT_F tabSys   = D2D1::RectF(334, 11, 480, 45);
 
-    bool hoverPorts = mouseInside_ && PtInRectF(tabPorts, mouseX_, mouseY_);
-    bool hoverSys   = mouseInside_ && PtInRectF(tabSys,   mouseX_, mouseY_);
+    bool hoverPorts = !menuOpen_ && mouseInside_ && PtInRectF(tabPorts, mouseX_, mouseY_);
+    bool hoverSys   = !menuOpen_ && mouseInside_ && PtInRectF(tabSys,   mouseX_, mouseY_);
 
     DrawRoundedRect(tabPorts, 8.0f,
                     activeTab_ == kTabPorts ? theme_.bgPillActive : (hoverPorts ? theme_.bgSurfaceHover : theme_.bgPillIdle),
@@ -416,7 +489,7 @@ void AppUI::DrawTopBar(float width) {
     hitButtons_.push_back({tabSys, kActSwitchTabSystem, L""});
 
     // Read-Only Guarantee Badge
-    if (width > 760.0f) {
+    if (width > 790.0f) {
         D2D1_RECT_F roRect = D2D1::RectF(width - 278.0f, 16.0f, width - 160.0f, 40.0f);
         DrawRoundedRect(roRect, 12.0f, theme_.bgBadgeActive, D2D1::ColorF(0, 0, 0, 0), 0.0f);
         DrawTextLine(L"Read-Only Mode", roRect, fmtSmall_, theme_.statusActive, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -424,10 +497,152 @@ void AppUI::DrawTopBar(float width) {
 
     // Theme Toggle Button (Right aligned)
     D2D1_RECT_F themeBtn = D2D1::RectF(width - 148.0f, 12.0f, width - 20.0f, 44.0f);
-    bool hoverTheme = mouseInside_ && PtInRectF(themeBtn, mouseX_, mouseY_);
+    bool hoverTheme = !menuOpen_ && mouseInside_ && PtInRectF(themeBtn, mouseX_, mouseY_);
     DrawRoundedRect(themeBtn, 8.0f, hoverTheme ? theme_.bgSurfaceHover : theme_.bgPillIdle, theme_.borderStrong, 1.0f);
     DrawTextLine(isDark_ ? L"Light Mode" : L"Dark Mode", themeBtn, fmtBold_, theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
     hitButtons_.push_back({themeBtn, kActToggleTheme, L""});
+}
+
+void AppUI::DrawBurgerMenuOverlay(float width, float height) {
+    constexpr float kDrawerW = 256.0f;
+
+    // Dimmed backdrop covering entire window (click anywhere outside drawer to close)
+    D2D1_RECT_F backdrop = D2D1::RectF(0, 0, width, height);
+    brush_->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, isDark_ ? 0.55f : 0.35f));
+    rt_->FillRectangle(backdrop, brush_);
+    hitButtons_.push_back({backdrop, kActCloseMenu, L""});
+
+    // Slide-out drawer panel
+    D2D1_RECT_F drawer = D2D1::RectF(0, 0, kDrawerW, height);
+    brush_->SetColor(theme_.bgHeader);
+    rt_->FillRectangle(drawer, brush_);
+    brush_->SetColor(theme_.borderStrong);
+    rt_->DrawLine(D2D1::Point2F(kDrawerW, 0), D2D1::Point2F(kDrawerW, height), brush_, 1.0f);
+
+    // Swallow clicks inside the drawer panel itself
+    hitButtons_.push_back({drawer, kActNone, L""});
+
+    // Drawer Header
+    DrawTextLine(L"Menu", D2D1::RectF(20, 12, 160, 44), fmtTitle_, theme_.textPrimary);
+
+    D2D1_RECT_F closeBtn = D2D1::RectF(kDrawerW - 46.0f, 12.0f, kDrawerW - 14.0f, 44.0f);
+    bool hoverClose = mouseInside_ && PtInRectF(closeBtn, mouseX_, mouseY_);
+    DrawRoundedRect(closeBtn, 8.0f, hoverClose ? theme_.bgSurfaceHover : theme_.bgPillIdle, theme_.border, 1.0f);
+    DrawTextLine(L"X", closeBtn, fmtBold_, theme_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    hitButtons_.push_back({closeBtn, kActCloseMenu, L""});
+
+    brush_->SetColor(theme_.border);
+    rt_->DrawLine(D2D1::Point2F(0, 56.0f), D2D1::Point2F(kDrawerW, 56.0f), brush_, 1.0f);
+
+    // Navigation Items
+    struct NavItem { const wchar_t* title; const wchar_t* sub; MainTab tab; int actId; };
+    const NavItem items[] = {
+        { L"Ports",           L"USB, Network, Power, Display, Audio", kTabPorts,    kActSwitchTabPorts },
+        { L"System Hardware", L"CPU, GPU(s), Disk(s), Memory, Temps", kTabSystem,   kActSwitchTabSystem },
+        { L"Settings",        L"Theme, Units, Sample Rate, Audio",    kTabSettings, kActSwitchTabSettings }
+    };
+
+    float iy = 72.0f;
+    for (const auto& item : items) {
+        D2D1_RECT_F r = D2D1::RectF(14.0f, iy, kDrawerW - 14.0f, iy + 58.0f);
+        bool selected = (activeTab_ == item.tab);
+        bool hover    = mouseInside_ && PtInRectF(r, mouseX_, mouseY_);
+        D2D1_COLOR_F bg = selected ? theme_.bgPillActive : (hover ? theme_.bgSurfaceHover : theme_.bgSurface);
+        DrawRoundedRect(r, 10.0f, bg, selected ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
+        DrawTextLine(item.title, D2D1::RectF(r.left + 14, r.top + 8,  r.right - 12, r.top + 30),
+                     fmtBold_, selected ? theme_.textOnAccent : theme_.textPrimary);
+        DrawTextLine(item.sub,   D2D1::RectF(r.left + 14, r.top + 30, r.right - 12, r.top + 50),
+                     fmtSmall_, selected ? D2D1::ColorF(1, 1, 1, 0.82f) : theme_.textSecondary);
+        hitButtons_.push_back({r, item.actId, L""});
+        iy += 68.0f;
+    }
+
+    // Drawer Footer
+    D2D1_RECT_F footBox = D2D1::RectF(14.0f, height - 74.0f, kDrawerW - 14.0f, height - 16.0f);
+    DrawRoundedRect(footBox, 8.0f, theme_.bgSurface, theme_.border, 1.0f);
+    DrawTextLine(L"Read-Only Mode Active", D2D1::RectF(footBox.left + 12, footBox.top + 8, footBox.right - 12, footBox.top + 28),
+                 fmtSmall_, theme_.statusActive);
+    DrawTextLine(L"Zero hardware writes or installs", D2D1::RectF(footBox.left + 12, footBox.top + 28, footBox.right - 12, footBox.top + 48),
+                 fmtSmall_, theme_.textMuted);
+}
+
+void AppUI::DrawSettingsPage(float width, float height) {
+    constexpr float kPad = 24.0f;
+    float maxW = std::min(width - kPad * 2.0f, 860.0f);
+    float left = (width - maxW) * 0.5f;
+    float y    = 76.0f;
+
+    DrawTextLine(L"Settings", D2D1::RectF(left, y, left + 300, y + 30), fmtTitle_, theme_.textPrimary);
+    DrawTextLine(L"In-app display & polling preferences only — never modifies Windows or device properties",
+                 D2D1::RectF(left, y + 30, left + maxW, y + 50), fmtSmall_, theme_.textSecondary);
+    y += 64.0f;
+
+    auto drawSettingRow = [&](const wchar_t* title, const wchar_t* desc,
+                              const std::vector<std::tuple<const wchar_t*, bool, int>>& opts) {
+        float rowH = 68.0f;
+        D2D1_RECT_F card = D2D1::RectF(left, y, left + maxW, y + rowH);
+        DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
+
+        DrawTextLine(title, D2D1::RectF(card.left + 16, card.top + 10, card.left + maxW * 0.52f, card.top + 34),
+                     fmtBold_, theme_.textPrimary);
+        DrawTextLine(desc,  D2D1::RectF(card.left + 16, card.top + 34, card.left + maxW * 0.54f, card.top + 56),
+                     fmtSmall_, theme_.textSecondary);
+
+        float btnW = (opts.size() == 3) ? 94.0f : 124.0f;
+        float gap  = 8.0f;
+        float totalW = static_cast<float>(opts.size()) * btnW + static_cast<float>(opts.size() - 1) * gap;
+        float bx = card.right - 16.0f - totalW;
+        for (const auto& [label, selected, actId] : opts) {
+            D2D1_RECT_F br = D2D1::RectF(bx, card.top + 18.0f, bx + btnW, card.bottom - 18.0f);
+            bool hover = !menuOpen_ && mouseInside_ && PtInRectF(br, mouseX_, mouseY_);
+            D2D1_COLOR_F bg = selected ? theme_.bgPillActive : (hover ? theme_.bgSurfaceHover : theme_.bgPillIdle);
+            D2D1_COLOR_F fg = selected ? theme_.textOnAccent : theme_.textPrimary;
+            DrawRoundedRect(br, 8.0f, bg, selected ? D2D1::ColorF(0, 0, 0, 0) : theme_.border, 1.0f);
+            DrawTextLine(label, br, fmtSmall_, fg, DWRITE_TEXT_ALIGNMENT_CENTER);
+            hitButtons_.push_back({br, actId, L""});
+            bx += btnW + gap;
+        }
+        y += rowH + 12.0f;
+    };
+
+    drawSettingRow(L"Appearance Theme", L"Switch between Dark Mode and Light Mode", {
+        { L"Dark Mode",  isDark_,  kActSetThemeDark },
+        { L"Light Mode", !isDark_, kActSetThemeLight }
+    });
+
+    drawSettingRow(L"Sampling Frequency", L"How often hardware ports and system sensors update", {
+        { L"0.5 sec", sampleIntervalMs_ == 500,  kActSetRate500 },
+        { L"1.0 sec", sampleIntervalMs_ == 1000, kActSetRate1000 },
+        { L"2.0 sec", sampleIntervalMs_ == 2000, kActSetRate2000 }
+    });
+
+    drawSettingRow(L"Temperature Unit", L"Display temperatures in Celsius or Fahrenheit across all views", {
+        { L"Celsius (\u00B0C)",    !useFahrenheit_, kActSetTempC },
+        { L"Fahrenheit (\u00B0F)",  useFahrenheit_, kActSetTempF }
+    });
+
+    drawSettingRow(L"Data Transfer Rate Unit", L"Choose Bytes/sec (MB/s) or Bits/sec (Mbps) for port & disk speeds", {
+        { L"Bytes/sec", !useBitsPerSec_, kActSetDataBytes },
+        { L"Bits/sec",   useBitsPerSec_, kActSetDataBits }
+    });
+
+    drawSettingRow(L"Unused Ports Visibility", L"Show or hide disconnected / unused ports (N/A) on the Main Ports Page", {
+        { showUnusedPorts_ ? L"Showing All" : L"Active Only", showUnusedPorts_, kActToggleShowUnused }
+    });
+
+    drawSettingRow(L"Audio Waveform Oscilloscope", L"Live loopback / passive-only mic waveform on Audio port detail pages", {
+        { enableAudioWave_ ? L"Enabled" : L"Disabled", enableAudioWave_, kActToggleAudioWave }
+    });
+
+    if (y + 66.0f < height) {
+        D2D1_RECT_F secCard = D2D1::RectF(left, y, left + maxW, y + 62.0f);
+        DrawRoundedRect(secCard, 10.0f, theme_.bgBadgeActive, theme_.border, 1.0f);
+        DrawTextLine(L"Read-Only Guarantee", D2D1::RectF(secCard.left + 16, secCard.top + 8, secCard.right - 16, secCard.top + 30),
+                     fmtBold_, theme_.statusActive);
+        DrawTextLine(L"Port Tool runs without administrator privileges (asInvoker) and never writes to device properties, drivers, or Windows settings.",
+                     D2D1::RectF(secCard.left + 16, secCard.top + 32, secCard.right - 16, secCard.top + 54),
+                     fmtSmall_, theme_.textSecondary);
+    }
 }
 
 // ============================================================================
@@ -463,8 +678,8 @@ void AppUI::DrawMainPage(float width, float height) {
     struct KpiItem { std::wstring label; std::wstring value; D2D1_COLOR_F accent; };
     std::vector<KpiItem> kpis = {
         { L"Active / Total Ports", std::to_wstring(activePorts) + L" / " + std::to_wstring(totalPorts), theme_.statusActive },
-        { L"Total Data To (Out)",  FormatBytesPerSec(totalToBps, true), theme_.seriesTo },
-        { L"Total Data Fro (In)",  FormatBytesPerSec(totalFroBps, true), theme_.seriesFro },
+        { L"Total Data To (Out)",  FormatBytesPerSec(totalToBps, true, useBitsPerSec_), theme_.seriesTo },
+        { L"Total Data Fro (In)",  FormatBytesPerSec(totalFroBps, true, useBitsPerSec_), theme_.seriesFro },
         { L"System Power",         FormatPower(sysPowerW, sysPowerDir, hasSysPower),
           (sysPowerDir == PowerDirection::Accepted) ? theme_.seriesPowerAcc : theme_.seriesPowerDel }
     };
@@ -585,12 +800,12 @@ void AppUI::DrawMainPage(float width, float height) {
                          D2D1::RectF(colDev, ry, colTo - 8, ry + kRowH),
                          fmtBody_, p->active ? theme_.textPrimary : theme_.textMuted);
 
-            std::wstring toStr = FormatBytesPerSec(p->current.bytesToSec, p->current.hasDataTo);
+            std::wstring toStr = FormatBytesPerSec(p->current.bytesToSec, p->current.hasDataTo, useBitsPerSec_);
             DrawTextLine(toStr, D2D1::RectF(colTo, ry, colFro - 8, ry + kRowH),
                          fmtMono_, p->current.hasDataTo ? theme_.seriesTo : theme_.textMuted,
                          DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-            std::wstring froStr = FormatBytesPerSec(p->current.bytesFroSec, p->current.hasDataFro);
+            std::wstring froStr = FormatBytesPerSec(p->current.bytesFroSec, p->current.hasDataFro, useBitsPerSec_);
             DrawTextLine(froStr, D2D1::RectF(colFro, ry, colPwr - 8, ry + kRowH),
                          fmtMono_, p->current.hasDataFro ? theme_.seriesFro : theme_.textMuted,
                          DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -663,12 +878,12 @@ void AppUI::DrawDetailPage(float width, float height) {
 
     float rx = hdrCard.right - 340.0f;
     DrawTextLine(L"TO (OUT)", D2D1::RectF(rx, hdrCard.top + 14, rx + 105, hdrCard.top + 32), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    DrawTextLine(FormatBytesPerSec(port->current.bytesToSec, port->current.hasDataTo),
+    DrawTextLine(FormatBytesPerSec(port->current.bytesToSec, port->current.hasDataTo, useBitsPerSec_),
                  D2D1::RectF(rx, hdrCard.top + 34, rx + 105, hdrCard.top + 62), fmtBold_,
                  port->current.hasDataTo ? theme_.seriesTo : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     DrawTextLine(L"FRO (IN)", D2D1::RectF(rx + 110, hdrCard.top + 14, rx + 215, hdrCard.top + 32), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    DrawTextLine(FormatBytesPerSec(port->current.bytesFroSec, port->current.hasDataFro),
+    DrawTextLine(FormatBytesPerSec(port->current.bytesFroSec, port->current.hasDataFro, useBitsPerSec_),
                  D2D1::RectF(rx + 110, hdrCard.top + 34, rx + 215, hdrCard.top + 62), fmtBold_,
                  port->current.hasDataFro ? theme_.seriesFro : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
@@ -719,6 +934,11 @@ void AppUI::DrawAudioWaveformGraph(const D2D1_RECT_F& card, const PortInfo& port
 
     D2D1_RECT_F plot = D2D1::RectF(card.left + 58.0f, card.top + 42.0f, card.right - 20.0f, card.bottom - 24.0f);
     DrawRoundedRect(plot, 6.0f, theme_.bgChart, theme_.gridLine, 1.0f);
+
+    if (!enableAudioWave_) {
+        DrawTextLine(L"Audio Waveform Disabled in Settings", plot, fmtHeading_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
 
     if (!port.active) {
         DrawTextLine(L"N/A — Audio Port Unplugged", plot, fmtHeading_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -838,7 +1058,7 @@ void AppUI::DrawDataGraph(const D2D1_RECT_F& card, const PortInfo& port) {
             brush_->SetColor(theme_.gridLine);
             rt_->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), brush_, 1.0f);
         }
-        DrawTextLine(FormatBytesPerSec(yMax * frac, true),
+        DrawTextLine(FormatBytesPerSec(yMax * frac, true, useBitsPerSec_),
                      D2D1::RectF(card.left + 6.0f, gy - 9.0f, plot.left - 8.0f, gy + 9.0f),
                      fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -950,8 +1170,8 @@ void AppUI::DrawDataGraph(const D2D1_RECT_F& card, const PortInfo& port) {
             }
 
             std::wstring tipTime = FormatSecondsAgo(n, idx);
-            std::wstring tipTo   = L"To:  " + FormatBytesPerSec(s.bytesToSec, s.hasDataTo);
-            std::wstring tipFro  = L"Fro: " + FormatBytesPerSec(s.bytesFroSec, s.hasDataFro);
+            std::wstring tipTo   = L"To:  " + FormatBytesPerSec(s.bytesToSec, s.hasDataTo, useBitsPerSec_);
+            std::wstring tipFro  = L"Fro: " + FormatBytesPerSec(s.bytesFroSec, s.hasDataFro, useBitsPerSec_);
 
             float tw = 152.0f, th = 62.0f;
             float tx = (cx + tw + 14.0f < plot.right) ? (cx + 10.0f) : (cx - tw - 10.0f);
@@ -1168,7 +1388,7 @@ void AppUI::DrawSystemMainPage(float width, float height) {
         { L"Processor Load",    cpuLoadStr,                                  theme_.seriesTo },
         { L"Memory In Use",     memLoadStr,                                  theme_.seriesFro },
         { L"CPU Package Power", FormatPowerPlain(pkgPowerW, pkgPowerW >= 0), theme_.seriesPowerDel },
-        { L"Peak Temperature",  FormatTempC(maxTempC, maxTempC >= 0),        theme_.seriesTemp }
+        { L"Peak Temperature",  FormatTempC(maxTempC, maxTempC >= 0, useFahrenheit_), theme_.seriesTemp }
     };
 
     for (size_t i = 0; i < kpis.size(); ++i) {
@@ -1257,7 +1477,7 @@ void AppUI::DrawSystemMainPage(float width, float height) {
         DrawTextLine(c.powerSummary, D2D1::RectF(colPwr, ry, colTemp - 8, ry + kRowH),
                      fmtMono_, c.current.hasPower ? theme_.seriesPowerDel : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-        DrawTextLine(c.tempSummary, D2D1::RectF(colTemp, ry, tableBox.right - 16, ry + kRowH),
+        DrawTextLine(FormatTempC(c.current.tempC, c.current.hasTemp, useFahrenheit_), D2D1::RectF(colTemp, ry, tableBox.right - 16, ry + kRowH),
                      fmtMono_, c.current.hasTemp ? theme_.seriesTemp : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
         D2D1_RECT_F hitR = D2D1::RectF(rowRect.left, std::max(rowRect.top, listTop),
@@ -1312,11 +1532,13 @@ void AppUI::DrawSystemDetailPage(float width, float height) {
                  comp->current.hasPower ? theme_.seriesPowerDel : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     DrawTextLine(L"TEMP",  D2D1::RectF(rx + 195, hdrCard.top + 10, rx + 275, hdrCard.top + 26), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    DrawTextLine(comp->tempSummary,  D2D1::RectF(rx + 195, hdrCard.top + 28, rx + 275, hdrCard.top + 54), fmtBold_,
+    DrawTextLine(FormatTempC(comp->current.tempC, comp->current.hasTemp, useFahrenheit_), D2D1::RectF(rx + 195, hdrCard.top + 28, rx + 275, hdrCard.top + 54), fmtBold_,
                  comp->current.hasTemp ? theme_.seriesTemp : theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     DrawTextLine(L"RATE",  D2D1::RectF(rx + 285, hdrCard.top + 10, rx + 364, hdrCard.top + 26), fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    DrawTextLine(L"0.5s",  D2D1::RectF(rx + 285, hdrCard.top + 28, rx + 364, hdrCard.top + 54), fmtBold_, theme_.statusActive, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    wchar_t rateStr[16];
+    swprintf_s(rateStr, L"%.1fs", static_cast<double>(sampleIntervalMs_) / 1000.0);
+    DrawTextLine(rateStr,  D2D1::RectF(rx + 285, hdrCard.top + 28, rx + 364, hdrCard.top + 54), fmtBold_, theme_.statusActive, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     y += hdrH + 12.0f;
 
@@ -1551,7 +1773,7 @@ void AppUI::DrawSysDataGraph(const D2D1_RECT_F& card, const SysCompInfo& comp) {
     float plotH = plot.bottom - plot.top;
 
     auto fmtVal = [&](double v, bool avail) {
-        return comp.dataIsBytesNotRate ? FormatBytesSize(v, avail) : FormatBytesPerSec(v, avail);
+        return comp.dataIsBytesNotRate ? FormatBytesSize(v, avail) : FormatBytesPerSec(v, avail, useBitsPerSec_);
     };
 
     for (int i = 0; i <= 4; ++i) {
@@ -1787,7 +2009,8 @@ void AppUI::DrawSysPowerGraph(const D2D1_RECT_F& card, const SysCompInfo& comp) 
 
 void AppUI::DrawSysTempGraph(const D2D1_RECT_F& card, const SysCompInfo& comp) {
     DrawRoundedRect(card, 10.0f, theme_.bgSurface, theme_.border, 1.0f);
-    DrawTextLine(L"Temperature vs Time (\u00B0C)", D2D1::RectF(card.left + 14, card.top + 8, card.left + 240, card.top + 30),
+    DrawTextLine(useFahrenheit_ ? L"Temperature vs Time (\u00B0F)" : L"Temperature vs Time (\u00B0C)",
+                 D2D1::RectF(card.left + 14, card.top + 8, card.left + 240, card.top + 30),
                  fmtHeading_, theme_.textPrimary);
     if (!comp.tempNote.empty()) {
         DrawTextLine(comp.tempNote, D2D1::RectF(card.left + 210, card.top + 9, card.right - 14, card.top + 30),
@@ -1818,8 +2041,10 @@ void AppUI::DrawSysTempGraph(const D2D1_RECT_F& card, const SysCompInfo& comp) {
             brush_->SetColor(theme_.gridLine);
             rt_->DrawLine(D2D1::Point2F(plot.left, gy), D2D1::Point2F(plot.right, gy), brush_, 1.0f);
         }
+        double tickC = yMax * frac;
+        double tickDisp = useFahrenheit_ ? (tickC * 9.0 / 5.0 + 32.0) : tickC;
         wchar_t lbl[24];
-        swprintf_s(lbl, L"%.0f\u00B0C", yMax * frac);
+        swprintf_s(lbl, useFahrenheit_ ? L"%.0f\u00B0F" : L"%.0f\u00B0C", tickDisp);
         DrawTextLine(lbl, D2D1::RectF(card.left + 4.0f, gy - 8.0f, plot.left - 6.0f, gy + 8.0f),
                      fmtSmall_, theme_.textMuted, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
@@ -1905,7 +2130,7 @@ void AppUI::DrawSysTempGraph(const D2D1_RECT_F& card, const SysCompInfo& comp) {
             float ty = plot.top + 6.0f;
             DrawRoundedRect(D2D1::RectF(tx, ty, tx + tw, ty + th), 6.0f, theme_.tooltipBg, theme_.tooltipBorder, 1.0f);
             DrawTextLine(FormatSecondsAgo(n, idx), D2D1::RectF(tx + 8, ty + 4, tx + tw - 8, ty + 18), fmtSmall_, theme_.textMuted);
-            DrawTextLine(FormatTempC(s.tempC, s.hasTemp), D2D1::RectF(tx + 8, ty + 18, tx + tw - 8, ty + 36), fmtMono_, theme_.seriesTemp);
+            DrawTextLine(FormatTempC(s.tempC, s.hasTemp, useFahrenheit_), D2D1::RectF(tx + 8, ty + 18, tx + tw - 8, ty + 36), fmtMono_, theme_.seriesTemp);
         }
     }
 }
